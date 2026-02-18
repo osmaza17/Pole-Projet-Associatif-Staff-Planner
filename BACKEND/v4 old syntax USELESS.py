@@ -1,0 +1,777 @@
+import flet as ft
+from pulp import *
+
+
+def solve_model(data: dict):
+
+    # ============================================================
+    # 0. DEFINE PARAMETERS
+    # ============================================================
+
+    # --- Dimensions ---
+    people = data["people"]
+    tasks = data["tasks"]
+    hours = data["hours"]  
+    days = data["days"]
+
+
+    # --- INPUT Parameters ---
+    # A[p,h,j] : Availability (1 = present)
+    availability   = data["availability"]
+
+    # D[t,h,j] : Demand (how many people needed)
+    demand         = data["demand"]
+
+    # S[p,t] : Skill matrix (1 = qualified)
+    skills         = data["skills"]
+
+    # F[p,t,h,j] : Force / Mandate matrix (1 = manager requires it)
+    force          = data["force"]
+
+    # E[p1,p2] : Social affinity  (1 = friends/together, -1 = enemies/separate, 0 = neutral)
+    social         = data["social"]
+
+    # L[p,t] : Min-quota wish (1 = person wants to try task at least once)
+    min_quota      = data["min_quota"]
+
+    # B[p,t] : Preference cost (higher = more dislike)
+    pref_cost      = data["pref_cost"]
+
+    # R[t] : Rotation switch (1 = no consecutive hours on that task)
+    rotation       = data["rotation"]
+
+    # X_prev[p,t,h,j] : Anchor plan from previous schedule
+    X_prev         = data["X_prev"]
+
+
+    # --- Priority Weights ---
+    W = data["weights"]
+
+    W_COVERAGE  = W["W_COVERAGE"]
+    W_MANDATE   = W["W_MANDATE"]
+    W_STABILITY = W["W_STABILITY"]
+    W_EQ_DAY    = W["W_EQ_DAY"]
+    W_EQ_TOTAL  = W["W_EQ_TOTAL"]
+    W_ROTATION  = W["W_ROTATION"]
+    W_SOCIAL    = W["W_SOCIAL"]
+    W_GAP       = W["W_GAP"]
+    W_QUOTA     = W["W_QUOTA"]
+    W_PREF      = W["W_PREF"]
+
+
+    # --- Auxiliary Functions ---
+    next_hour = {hours[i]: hours[i+1] for i in range(len(hours)-1)}
+    friend_pairs = [(p1,p2) for (p1,p2),v in social.items() if v==1]
+    enemy_pairs  = [(p1,p2) for (p1,p2),v in social.items() if v==-1]
+
+
+    # ============================================================
+    # 1.  CREATE THE MODEL
+    # ============================================================
+
+    model = LpProblem("Staff_Scheduling", LpMinimize)
+
+
+    # ============================================================
+    # 2.  DECISION VARIABLES
+    # ============================================================
+
+    # x[p,t,h,j] — assignment (binary)
+    x = LpVariable.dicts("x", ((p,t,h,j) for p in people for t in tasks for h in hours for j in days), cat=LpBinary)
+
+    # m[t,h,j] — number of missing staff
+    m = LpVariable.dicts("m", ((t,h,j) for t in tasks for h in hours for j in days), lowBound=0, cat=LpInteger)
+
+    # u[p,t,h,j] — unfulfilled mandate
+    u = LpVariable.dicts("u", ((p,t,h,j) for p in people for t in tasks for h in hours for j in days), lowBound=0, cat=LpInteger)
+
+    # n_max[j], n_min[j] — daily equity bounds
+    n_max = LpVariable.dicts("n_max", days, lowBound=0, cat=LpInteger)
+    n_min = LpVariable.dicts("n_min", days, lowBound=0, cat=LpInteger)
+
+    # z_max, z_min — global equity bounds
+    z_max = LpVariable("z_max", lowBound=0, cat=LpInteger)
+    z_min = LpVariable("z_min", lowBound=0, cat=LpInteger)
+
+    # c[p,t,h,j] — consecutive-hour penalty (binary)
+    # Only for hours that have a successor and tasks with R=1
+    consec_keys = [
+        (p,t,h,j)
+        for p in people for t in tasks for h in hours[:-1] for j in days
+        if rotation[t] == 1]
+    
+    c = LpVariable.dicts("c", consec_keys, cat=LpBinary) if consec_keys else {}
+
+    # v[p,p',t,h,j] — social violation (together / friends)
+    friend_pairs = [(p1,p2) for (p1,p2), val in social.items() if val == 1]
+    v = LpVariable.dicts(
+        "v",
+        ((p1,p2,t,h,j) for (p1,p2) in friend_pairs for t in tasks for h in hours for j in days),
+        lowBound=0, cat=LpContinuous,
+    ) if friend_pairs else {}
+
+    # w[p,p',t,h,j] — social violation (separate / enemies)
+    enemy_pairs = [(p1,p2) for (p1,p2), val in social.items() if val == -1]
+    w = LpVariable.dicts(
+        "w",
+        ((p1,p2,t,h,j) for (p1,p2) in enemy_pairs for t in tasks for h in hours for j in days),
+        lowBound=0, cat=LpContinuous,
+    ) if enemy_pairs else {}
+
+    # q[p,t] — quota missed (binary)
+    q = LpVariable.dicts("q", ((p,t) for p in people for t in tasks), cat=LpBinary)
+
+    # d[p,t,h,j] — deviation flag (binary)
+    d = LpVariable.dicts("d", ((p,t,h,j) for p in people for t in tasks for h in hours for j in days), cat=LpBinary)
+
+    # s[p,h,j] — start flag (binary)
+    s = LpVariable.dicts("s", ((p,h,j) for p in people for h in hours for j in days), cat=LpBinary)
+
+    # f[p,h,j] — finish flag (binary)
+    f = LpVariable.dicts("f", ((p,h,j) for p in people for h in hours for j in days), cat=LpBinary)
+
+    # g[p,h,j] — gap flag (binary)
+    g = LpVariable.dicts("g", ((p,h,j) for p in people for h in hours for j in days), cat=LpBinary)
+
+
+
+    # ============================================================
+    # 3.  OBJECTIVE FUNCTION
+    # ============================================================
+
+    obj = []
+
+    # 1. Coverage penalty
+    obj += [W_COVERAGE * m[(t,h,j)] for t in tasks for h in hours for j in days]
+
+    # 2. Mandate penalty
+    obj += [W_MANDATE * u[(p,t,h,j)] for p in people for t in tasks for h in hours for j in days]
+
+    # 3. Stability penalty
+    obj += [W_STABILITY * d[(p,t,h,j)] for p in people for t in tasks for h in hours for j in days]
+
+    # 4. Daily equity penalty
+    obj += [W_EQ_DAY * (n_max[j] - n_min[j]) for j in days]
+
+    # 5. Global equity penalty
+    obj.append(W_EQ_TOTAL * (z_max - z_min))
+
+    # 6. Rotation fatigue penalty
+    if consec_keys:
+        obj += [W_ROTATION * c[k] for k in consec_keys]
+
+    # 7. Social penalties
+    if friend_pairs:
+        obj += [W_SOCIAL * v[(p1,p2,t,h,j)] for (p1,p2) in friend_pairs for t in tasks for h in hours for j in days]
+    if enemy_pairs:
+        obj += [W_SOCIAL * w[(p1,p2,t,h,j)] for (p1,p2) in enemy_pairs for t in tasks for h in hours for j in days]
+
+    # 8. Gap penalty
+    obj += [W_GAP * g[(p,h,j)] for p in people for h in hours for j in days]
+
+    # 9. Quota penalty
+    obj += [W_QUOTA * q[(p,t)] for p in people for t in tasks]
+
+    # 10. Preference cost
+    obj += [W_PREF * pref_cost[(p,t)] * x[(p,t,h,j)] for p in people for t in tasks for h in hours for j in days]
+
+    model += lpSum(obj), "Total_Penalty"
+
+    # ============================================================
+    # 4.  CONSTRAINTS
+    # ============================================================
+
+    # --- A. Task Coverage ---
+    for t in tasks:
+        for h in hours:
+            for j in days:
+                model += (lpSum(x[(p,t,h,j)] for p in people) + m[(t,h,j)] == demand.get((t,h,j),0), f"Coverage_{t}_{h}_{j}")
+
+    # --- B. Manual Mandates ---
+    for p in people:
+        for t in tasks:
+            for h in hours:
+                for j in days:
+                    if force.get((p,t,h,j),0) == 1:
+                        model += (1 - x[(p,t,h,j)] <= u[(p,t,h,j)], f"Mandate_{p}_{t}_{h}_{j}")
+
+    # --- C. Physical Availability (Hard) ---
+    for p in people:
+        for h in hours:
+            for j in days:
+                model += (lpSum(x[(p,t,h,j)] for t in tasks) <= availability.get((p,h,j),0), f"Avail_{p}_{h}_{j}")
+
+    # --- D. Skill Filter (Hard) ---
+    for p in people:
+        for t in tasks:
+            if skills.get((p,t),0) == 0:
+                for h in hours:
+                    for j in days:
+                        model += (x[(p,t,h,j)] == 0, f"Skill_{p}_{t}_{h}_{j}")
+
+    # --- E. Double-Squeeze Equity ---
+    for j in days:
+        for p in people:
+            td = lpSum(x[(p,t,h,j)] for t in tasks for h in hours)
+            model += (td <= n_max[j], f"DayMax_{p}_{j}")
+            model += (td >= n_min[j], f"DayMin_{p}_{j}")
+
+    for p in people:
+        tg = lpSum(x[(p,t,h,j)] for t in tasks for h in hours for j in days)
+        model += (tg <= z_max, f"GlobalMax_{p}")
+        model += (tg >= z_min, f"GlobalMin_{p}")
+
+    # --- F. Rotation Fatigue ---
+    for key in consec_keys:
+        p,t,h,j = key
+        model += (x[(p,t,h,j)] + x[(p,t,next_hour[h],j)] - c[key] <= 1, f"Rotation_{p}_{t}_{h}_{j}")
+
+    # --- G. Social Constraints ---
+    # G.1 Together (Friends)
+    for (p1,p2) in friend_pairs:
+        for t in tasks:
+            for h in hours:
+                for j in days:
+                    model += (x[(p1,t,h,j)] - x[(p2,t,h,j)] <= v[(p1,p2,t,h,j)], f"TogetherA_{p1}_{p2}_{t}_{h}_{j}")
+                    model += (x[(p2,t,h,j)] - x[(p1,t,h,j)] <= v[(p1,p2,t,h,j)], f"TogetherB_{p1}_{p2}_{t}_{h}_{j}")
+
+    # G.2 Separate (Enemies)
+    for (p1,p2) in enemy_pairs:
+        for t in tasks:
+            for h in hours:
+                for j in days:
+                    model += (x[(p1,t,h,j)]+x[(p2,t,h,j)] - w[(p1,p2,t,h,j)] <= 1, f"Separate_{p1}_{p2}_{t}_{h}_{j}")
+
+    # --- H. Minimum Quota ---
+    for p in people:
+        for t in tasks:
+            for j in days:
+                model += (lpSum(x[(p,t,h,j)] for h in hours) + q[(p,t)] >= min_quota.get((p,t),0), f"Quota_{p}_{t}_{j}")
+
+    # --- I. Stability / Deviation ---
+    for p in people:
+        for t in tasks:
+            for h in hours:
+                for j in days:
+                    prev = X_prev.get((p,t,h,j),0)
+                    model += (d[(p,t,h,j)] >= prev - x[(p,t,h,j)], f"DevA_{p}_{t}_{h}_{j}")
+                    model += (d[(p,t,h,j)] >= x[(p,t,h,j)] - prev, f"DevB_{p}_{t}_{h}_{j}")
+
+
+
+
+
+# ============================================================
+# 5.  SOLVE
+# ============================================================
+
+    solver = GUROBI(
+        msg=True,          # Shows solver progress in console (nodes, gap,etc.)
+        timeLimit=1200,    # Max execution seconds. If reached, returns the best solution found
+        gapRel=0.001,      # Max % difference between solution and theoretical bound to stop (0.01 = 1%)
+        mip=True,          # True=solves integer (binary/integer). False=ignores integrality, solves continuous LP
+
+        # --- MIP Performance ---
+        Threads=12,              # Parallel CPU threads. More is not always better due to coordination overhead
+        MIPFocus=2,             # Strategy=0=balanced, 1=find feasible quickly, 2=prove optimality, 3=improve bound
+        Presolve=2,             # Prior simplification=0=off, 1=conservative, 2=aggressive (reduces model but costs time)
+        PrePasses=-1,           # Presolve passes. -1=no limit,Gurobi decides when to stop
+        # PreSparsify=1,        # Reduces constraint matrix density to accelerate linear algebra
+        # PreDual=-1,           # Dualizes the model in presolve. Sometimes the dual solves faster
+
+        # --- Structure ---
+        Symmetry=2,             # Detects interchangeable solutions to prune redundant branches. 0=off, 1=conservative, 2=aggressive
+        Disconnected=2,       # Detects independent subproblems to solve them separately
+        IntegralityFocus=1,   # Strives harder for integers to be exactly integers (not almost integers)
+
+        # --- Solver Method ---
+        Method=1,            # For LP=-1=auto, 0=primal simplex, 1=dual simplex, 2=barrier, 3=concurrent
+        # NodeMethod=1,           # LP at MIP nodes=-1=auto, 0=primal, 1=dual (reuses parent basis), 2=barrier
+        # ConcurrentMIP=1,      # Launches N MIP solves with different strategies. The first to finish wins
+
+        # --- Solution Pool (stores multiple feasible solutions) ---
+        # PoolSolutions=10,     # How many solutions to store besides the optimal one
+        # PoolGap=0.1,          # Only stores solutions within this % of the optimal
+        # PoolSearchMode=0,     # 0=stores those found along the way, 1=searches more actively, 2=searches for the N best
+
+    )
+
+    # --- Solve the model ---
+    model.solve(solver)
+    
+
+    # --- Extract solution into a dict ---
+    sol = {}
+    sol["status"] = LpStatus[model.status]
+    # assignment[j][p][h] = task name or None
+    assignment = {}
+    for j in days:
+        assignment[j] = {}
+        for p in people:
+            assignment[j][p] = {}
+            for h in hours:
+                assigned_task = None
+                for t in tasks:
+                    if x[(p,t,h,j)].varValue and x[(p,t,h,j)].varValue > 0.5:
+                        assigned_task = t
+                        break
+                assignment[j][p][h] = assigned_task
+    sol["assignment"] = assignment
+
+    # missing
+    missing = []
+    for t in tasks:
+        for h in hours:
+            for j in days:
+                val = m[(t,h,j)].varValue
+                if val and val > 0.01:
+                    missing.append(f"{t} @ {h}, {j}: {val:.0f} missing")
+    sol["missing"] = missing
+
+    # workload
+    workload = {}
+    for p in people:
+        workload[p] = sum(x[(p,t,h,j)].varValue for t in tasks for h in hours for j in days if x[(p,t,h,j)].varValue)
+    sol["workload"] = workload
+    sol["z_max"] = z_max.varValue
+    sol["z_min"] = z_min.varValue
+
+    # gaps
+    gaps = []
+    for p in people:
+        for j in days:
+            for h in hours:
+                if g[(p,h,j)].varValue and g[(p,h,j)].varValue > 0.5:
+                    gaps.append(f"{p}, {j}, {h}")
+    sol["gaps"] = gaps
+
+    # social
+    soc_issues = []
+    for (p1,p2) in friend_pairs:
+        for t in tasks:
+            for h in hours:
+                for j in days:
+                    val = v[(p1,p2,t,h,j)].varValue
+                    if val and val > 0.5:
+                        soc_issues.append(f"Friends {p1}&{p2} separated @ {t}, {h}, {j}")
+    for (p1,p2) in enemy_pairs:
+        for t in tasks:
+            for h in hours:
+                for j in days:
+                    val = w[(p1,p2,t,h,j)].varValue
+                    if val and val > 0.5:
+                        soc_issues.append(f"Enemies {p1}&{p2} together @ {t}, {h}, {j}")
+    sol["social_issues"] = soc_issues
+
+    return sol
+
+
+# ============================================================
+# FLET UI
+# ============================================================
+
+# Palette for task colors (cycles if more tasks than colors)
+TASK_COLORS = [
+    ("#CE93D8", "#000000"),  # purple
+    ("#80DEEA", "#000000"),  # cyan
+    ("#FFF59D", "#000000"),  # yellow
+    ("#A5D6A7", "#000000"),  # green
+    ("#FFAB91", "#000000"),  # orange
+    ("#90CAF9", "#000000"),  # blue
+    ("#F48FB1", "#000000"),  # pink
+    ("#E6EE9C", "#000000"),  # lime
+    ("#B0BEC5", "#000000"),  # grey
+]
+UNAVAIL_COLOR = "#ED97B5"   # light pink for unavailable slots
+
+
+def main(page: ft.Page):
+    page.title = "Staff Scheduler"
+    page.scroll = ft.ScrollMode.AUTO
+    page.window.width = 1200
+    page.window.height = 800
+
+    avail_st,demand_st,skills_st = {}, {}, {}
+    force_st,social_st,quota_st,rotation_st = {}, {}, {}, {}
+
+    tf_people = ft.TextField(
+        value="Christopher\nBrooklyn\nEzekiel\nBella\nMiles\nClaire\nJaxon\nSkylar", multiline=True, min_lines=8, max_lines=200,
+        label="People (one per line)", expand=True)
+    tf_tasks = ft.TextField(
+        value="Comprar leche\nMeditar\nPlanificar semana", multiline=True, min_lines=8, max_lines=200,
+        label="Tasks (one per line)", expand=True)
+    tf_hours = ft.TextField(
+        value="08:00\n09:00\n10:00\n11:00\n12:00\n13:00\n14:00\n15:00\n16:00\n17:00",
+        multiline=True, min_lines=8, max_lines=200,
+        label="Hours (one per line)", expand=True)
+    tf_days = ft.TextField(
+        value="Mon\nTue\nWed", multiline=True, min_lines=8, max_lines=200,
+        label="Days (one per line)", expand=True)
+
+    def dims():
+        return (
+            [x.strip() for x in tf_people.value.split("\n") if x.strip()],
+            [x.strip() for x in tf_tasks.value.split("\n") if x.strip()],
+            [x.strip() for x in tf_hours.value.split("\n") if x.strip()],
+            [x.strip() for x in tf_days.value.split("\n") if x.strip()],
+        )
+
+    avail_ct    = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True)
+    demand_ct   = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True)
+    skills_ct   = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True)
+    force_ct    = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True)
+    social_ct   = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True)
+    quota_ct    = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True)
+    rotation_ct = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True)
+    output_ct   = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True)
+
+    W_LBL = 90; W_BTN = 58; W_CELL = 65
+
+    def make_toggle(sd, key, default):
+        if key not in sd: sd[key] = default
+        val = sd[key]
+        btn = ft.ElevatedButton(
+            str(val), width=W_BTN, height=30, data=key,
+            bgcolor=ft.Colors.GREEN_400 if val else ft.Colors.RED_400,
+            color=ft.Colors.WHITE, style=ft.ButtonStyle(padding=0))
+        def _click(e, _sd=sd, _k=key):
+            _sd[_k] = 1 - _sd[_k]
+            e.control.text = str(_sd[_k])
+            e.control.bgcolor = ft.Colors.GREEN_400 if _sd[_k] else ft.Colors.RED_400
+            e.control.update()
+        btn.on_click = _click
+        return btn
+
+    def lbl(text,w=W_LBL):
+        return ft.Container(ft.Text(text,size=11, no_wrap=True), width=w)
+
+    def hdr_row(labels, w=W_BTN):
+        return ft.Row(
+            [ft.Container(width=W_LBL)] + [ft.Container(ft.Text(l, size=10), width=w) for l in labels],
+            spacing=2)
+
+    def build_avail():
+        p,t,h,D = dims(); avail_ct.controls.clear()
+        for j in D:
+            avail_ct.controls.append(ft.Text(f"-- {j} --", weight=ft.FontWeight.BOLD, size=14))
+            avail_ct.controls.append(hdr_row(H))
+            for p in P:
+                avail_ct.controls.append(ft.Row(
+                    [lbl(p)] + [make_toggle(avail_st,(p,h,j), 1) for h in H], spacing=2))
+            avail_ct.controls.append(ft.Divider())
+        page.update()
+
+    def build_demand():
+        p,t,h,D = dims(); demand_ct.controls.clear()
+        for j in D:
+            demand_ct.controls.append(ft.Text(f"-- {j} --", weight=ft.FontWeight.BOLD, size=14))
+            demand_ct.controls.append(hdr_row(h,W_CELL))
+            for t in T:
+                cells = []
+                for h in H:
+                    k = (t,h,j)
+                    if k not in demand_st: demand_st[k] = "1"
+                    tf = ft.TextField(value=demand_st[k], width=W_CELL, height=35,
+                                      text_size=12, data=k, content_padding=ft.padding.all(4))
+                    def _ch(e, _k=k): demand_st[_k] = e.control.value
+                    tf.on_change = _ch; cells.append(tf)
+                demand_ct.controls.append(ft.Row([lbl(t)] + cells, spacing=2))
+            demand_ct.controls.append(ft.Divider())
+        page.update()
+
+    def build_skills():
+        p,t,h,D = dims(); skills_ct.controls.clear()
+        skills_ct.controls.append(hdr_row(t,70))
+        for p in P:
+            skills_ct.controls.append(ft.Row(
+                [lbl(p)] + [make_toggle(skills_st,(p,t), 1) for t in T], spacing=2))
+        page.update()
+
+    def build_force():
+        p,t,h,D = dims(); force_ct.controls.clear()
+        for t in T:
+            for j in D:
+                force_ct.controls.append(ft.Text(f"-- {t} / {j} --", weight=ft.FontWeight.BOLD, size=14))
+                force_ct.controls.append(hdr_row(H))
+                for p in P:
+                    force_ct.controls.append(ft.Row(
+                        [lbl(p)] + [make_toggle(force_st,(p,t,h,j), 0) for h in H], spacing=2))
+                force_ct.controls.append(ft.Divider())
+        page.update()
+
+    def build_social():
+        p,t,h,D = dims(); social_ct.controls.clear()
+        if len(P) < 2: page.update(); return
+        social_ct.controls.append(hdr_row(P[1:], 70))
+        _map_lbl  = {0: "~", 1: "+", -1: "-"}
+        _map_clr  = {0: ft.Colors.GREY_400, 1: ft.Colors.GREEN_400, -1: ft.Colors.RED_400}
+        _next_val = {0: 1, 1: -1, -1: 0}
+        for i, p1 in enumerate(P):
+            cells = []
+            for p2 in P[1:]:
+                j2 = P.index(p2)
+                if j2 > i:
+                    k = (p1,p2)
+                    if k not in social_st: social_st[k] = 0
+                    sv = social_st[k]
+                    btn = ft.ElevatedButton(_map_lbl[sv], width=70, height=30, data=k,
+                                            bgcolor=_map_clr[sv], color=ft.Colors.WHITE,
+                                            style=ft.ButtonStyle(padding=0))
+                    def _click(e, _k=k):
+                        social_st[_k] = _next_val[social_st[_k]]
+                        nv = social_st[_k]
+                        e.control.text = _map_lbl[nv]
+                        e.control.bgcolor = _map_clr[nv]
+                        e.control.update()
+                    btn.on_click = _click; cells.append(btn)
+                else:
+                    cells.append(ft.Container(width=70))
+            if cells:
+                social_ct.controls.append(ft.Row([lbl(p1)] + cells, spacing=2))
+        page.update()
+
+    def build_quota():
+        p,t,h,D = dims(); quota_ct.controls.clear()
+        quota_ct.controls.append(hdr_row(t,70))
+        for p in P:
+            cells = []
+            for t in T:
+                k = (p,t)
+                if k not in quota_st: quota_st[k] = "0"
+                tf = ft.TextField(value=quota_st[k], width=70, height=35,
+                                  text_size=12, data=k, content_padding=ft.padding.all(4))
+                def _ch(e, _k=k): quota_st[_k] = e.control.value
+                tf.on_change = _ch; cells.append(tf)
+            quota_ct.controls.append(ft.Row([lbl(p)] + cells, spacing=2))
+        page.update()
+
+    def build_rotation():
+        p,t,h,D = dims(); rotation_ct.controls.clear()
+        for t in T:
+            if t not in rotation_st: rotation_st[t] = 1
+            sw = ft.Switch(label=t,value=rotation_st[t]==1, data=t)
+            def _ch(e, _t=t): rotation_st[_t] = 1 if e.control.value else 0
+            sw.on_change = _ch; rotation_ct.controls.append(sw)
+        page.update()
+
+    builders = {1: build_avail, 2: build_demand, 3: build_skills,
+                4: build_force, 5: build_social, 6: build_quota, 7: build_rotation}
+
+    def on_tab_change(e):
+        idx = e.control.selected_index
+        if idx in builders: builders[idx]()
+
+    # ---- Build visual schedule grid ----
+    def build_output_grid(sol, p,t,h,D, availability):
+        output_ct.controls.clear()
+        output_ct.controls.append(ft.Text(f"Status: {sol['status']}", weight=ft.FontWeight.BOLD, size=16))
+        output_ct.controls.append(ft.Divider())
+
+        # Build task -> color map
+        tc = {}
+        for i, t in enumerate(T):
+            bg, fg = TASK_COLORS[i % len(TASK_COLORS)]
+            tc[t] = (bg, fg)
+
+        CW = 75  # cell width
+        CH = 36  # cell height
+        NW = 110 # name column width
+        TW = 50  # total column width
+
+        for j in D:
+            output_ct.controls.append(ft.Text(f"-- {j} --", weight=ft.FontWeight.BOLD, size=16))
+
+            # Header row
+            hdr = [ft.Container(
+                ft.Text("Person", size=11, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE),
+                width=NW, height=Ch,bgcolor="#455A64",
+                alignment=ft.alignment.center,
+                border=ft.border.all(1, "#37474F"))]
+            for h in H:
+                hdr.append(ft.Container(
+                    ft.Text(h,size=11, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE),
+                    width=CW, height=Ch,bgcolor="#455A64",
+                    alignment=ft.alignment.center,
+                    border=ft.border.all(1, "#37474F")))
+            hdr.append(ft.Container(
+                ft.Text("Total", size=11, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE),
+                width=TW, height=Ch,bgcolor="#455A64",
+                alignment=ft.alignment.center,
+                border=ft.border.all(1, "#37474F")))
+            output_ct.controls.append(ft.Row(hdr, spacing=0))
+
+            # Data rows
+            asgn = sol["assignment"][j]
+            for idx_p,p in enumerate(P):
+                row_bg = "#263238" if idx_p % 2 == 0 else "#37474F"
+                cells = [ft.Container(
+                    ft.Text(p,size=12, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE),
+                    width=NW, height=Ch,bgcolor=row_bg,
+                    alignment=ft.alignment.center_left,
+                    padding=ft.padding.only(left=8),
+                    border=ft.border.all(1, "#455A64"))]
+
+                total = 0
+                for h in H:
+                    task = asgn[p][h]
+                    avail = availability.get((p,h,j), 1)
+                    if task:
+                        bg, fg = tc[task]
+                        total += 1
+                        cell = ft.Container(
+                            ft.Text(task, size=11, weight=ft.FontWeight.BOLD, color=fg, text_align=ft.TextAlign.CENTER),
+                            width=CW, height=Ch,bgcolor=bg,
+                            alignment=ft.alignment.center,
+                            border=ft.border.all(1, "#455A64"),
+                            border_radius=4)
+                    elif avail == 0:
+                        cell = ft.Container(
+                            width=CW, height=Ch,bgcolor=UNAVAIL_COLOR,
+                            border=ft.border.all(1, "#455A64"),
+                            border_radius=4)
+                    else:
+                        cell = ft.Container(
+                            width=CW, height=Ch,bgcolor=row_bg,
+                            border=ft.border.all(1, "#455A64"))
+                    cells.append(cell)
+
+                cells.append(ft.Container(
+                    ft.Text(str(int(total)), size=12, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE,
+                            text_align=ft.TextAlign.CENTER),
+                    width=TW, height=Ch,bgcolor=row_bg,
+                    alignment=ft.alignment.center,
+                    border=ft.border.all(1, "#455A64")))
+                output_ct.controls.append(ft.Row(cells, spacing=0))
+
+            # Legend
+            legend_items = [ft.Container(
+                ft.Text(t,size=10, weight=ft.FontWeight.BOLD, color=tc[t][1]),
+                bgcolor=tc[t][0], padding=ft.padding.symmetric(6, 10),
+                border_radius=4) for t in T]
+            legend_items.append(ft.Container(
+                ft.Text("Unavailable", size=10), bgcolor=UNAVAIL_COLOR,
+                padding=ft.padding.symmetric(6, 10), border_radius=4))
+            output_ct.controls.append(ft.Row(legend_items, spacing=8))
+            output_ct.controls.append(ft.Divider())
+
+        # --- Summary sections ---
+        output_ct.controls.append(ft.Text("MISSING STAFF", weight=ft.FontWeight.BOLD, size=14))
+        if sol["missing"]:
+            for line in sol["missing"]:
+                output_ct.controls.append(ft.Text(f"  {line}", size=12))
+        else:
+            output_ct.controls.append(ft.Text("  None -- all demand covered!", size=12, italic=True))
+
+        output_ct.controls.append(ft.Text("WORKLOAD EQUITY", weight=ft.FontWeight.BOLD, size=14))
+        for p in P:
+            output_ct.controls.append(ft.Text(f"  {p}: {sol['workload'][p]:.0f} hours", size=12))
+        output_ct.controls.append(ft.Text(
+            f"  Global range: max={sol['z_max']:.0f}, min={sol['z_min']:.0f}", size=12, italic=True))
+
+        output_ct.controls.append(ft.Text("GAPS", weight=ft.FontWeight.BOLD, size=14))
+        if sol["gaps"]:
+            for line in sol["gaps"]:
+                output_ct.controls.append(ft.Text(f"  {line}", size=12))
+        else:
+            output_ct.controls.append(ft.Text("  None -- compact schedules!", size=12, italic=True))
+
+        output_ct.controls.append(ft.Text("SOCIAL", weight=ft.FontWeight.BOLD, size=14))
+        if sol["social_issues"]:
+            for line in sol["social_issues"]:
+                output_ct.controls.append(ft.Text(f"  {line}", size=12))
+        else:
+            output_ct.controls.append(ft.Text("  None -- all respected!", size=12, italic=True))
+
+    # --- solve ---
+    def do_solve(e):
+        p,t,h,D = dims()
+
+        availability = {}
+        for p in P:
+            for h in H:
+                for j in D:
+                    availability[(p,h,j)] = avail_st.get((p,h,j), 1)
+        demand = {}
+        for t in T:
+            for h in H:
+                for j in D:
+                    raw = demand_st.get((t,h,j), "1")
+                    try: demand[(t,h,j)] = int(raw)
+                    except: demand[(t,h,j)] = 0
+        skills = {}
+        for p in P:
+            for t in T:
+                skills[(p,t)] = skills_st.get((p,t), 1)
+        force = {}
+        for p in P:
+            for t in T:
+                for h in H:
+                    for j in D:
+                        force[(p,t,h,j)] = force_st.get((p,t,h,j), 0)
+        social = {}
+        for i, p1 in enumerate(P):
+            for p2 in P[i+1:]:
+                social[(p1,p2)] = social_st.get((p1,p2), 0)
+        mq = {}
+        for p in P:
+            for t in T:
+                raw = quota_st.get((p,t), "0")
+                try: mq[(p,t)] = int(raw)
+                except: mq[(p,t)] = 0
+        rotation = {t: rotation_st.get(t,1) for t in T}
+        pref_cost = {(p,t): 1 for p in P for t in T}
+        X_prev = {(p,t,h,j): 0 for p in P for t in T for h in H for j in D}
+        weights = dict(W_COVERAGE=100000, W_MANDATE=50000, W_STABILITY=10000,
+                       W_EQ_DAY=5000, W_EQ_TOTAL=1000, W_ROTATION=500,
+                       W_SOCIAL=100, W_GAP=50, W_QUOTA=10, W_PREF=5)
+
+        data = dict(people=p,tasks=t,hours=h,days=D,
+                    availability=availability, demand=demand, skills=skills,
+                    force=force, social=social, min_quota=mq,
+                    pref_cost=pref_cost,rotation=rotation, X_prev=X_prev, weights=weights)
+
+        output_ct.controls.clear()
+        output_ct.controls.append(ft.ProgressRing())
+        output_ct.controls.append(ft.Text("Solving...", italic=True))
+        tabs.selected_index = 8
+        page.update()
+
+        try:
+            sol = solve_model(data)
+            build_output_grid(sol, p,t,h,D, availability)
+        except Exception as ex:
+            output_ct.controls.clear()
+            output_ct.controls.append(ft.Text(f"ERROR: {ex}", color=ft.Colors.RED_400, size=14))
+        page.update()
+
+    solve_btn = ft.ElevatedButton("SOLVE", on_click=do_solve,
+                                   bgcolor=ft.Colors.BLUE_600, color=ft.Colors.WHITE,
+                                   height=45, width=200)
+
+    dim_tab_content = ft.Container(
+        content=ft.Row(
+            controls=[tf_people, tf_tasks, tf_hours, tf_days],
+            spacing=20,
+            alignment=ft.MainAxisAlignment.START,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        ),
+        padding=20, expand=True)
+
+    tabs = ft.Tabs(
+        selected_index=0, on_change=on_tab_change, expand=True,
+        tabs=[
+            ft.Tab(text="Dimensions",   content=dim_tab_content),
+            ft.Tab(text="Availability", content=ft.Container(avail_ct,padding=10, expand=True)),
+            ft.Tab(text="Demand",       content=ft.Container(demand_ct,padding=10, expand=True)),
+            ft.Tab(text="Skills",       content=ft.Container(skills_ct,padding=10, expand=True)),
+            ft.Tab(text="Force",        content=ft.Container(force_ct,padding=10, expand=True)),
+            ft.Tab(text="Social",       content=ft.Container(social_ct,padding=10, expand=True)),
+            ft.Tab(text="Min Quota",    content=ft.Container(quota_ct,padding=10, expand=True)),
+            ft.Tab(text="Rotation",     content=ft.Container(rotation_ct,padding=10, expand=True)),
+            ft.Tab(text="Output",       content=ft.Container(output_ct,padding=10, expand=True)),
+        ])
+
+    page.add(ft.Row([solve_btn], alignment=ft.MainAxisAlignment.CENTER), tabs)
+
+
+ft.app(target=main)

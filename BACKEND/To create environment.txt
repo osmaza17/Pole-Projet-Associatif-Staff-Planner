@@ -1,0 +1,80 @@
+================================================================
+ INSTALLATION AND EXECUTION MANUAL (PYTHON / VS CODE)
+ PROJECT: Staffing-Optimization-BDI
+================================================================
+
+PREREQUISITE:
+Open the project folder in VS Code and open a terminal (Ctrl + `).
+
+
+----------------------------------------------------------------
+STEP 1: INITIAL CLEANUP
+----------------------------------------------------------------
+If a folder named "venv", "env" or ".venv" already exists in your folder
+(copied from another location), DELETE IT MANUALLY.
+Virtual environments do not work if they are moved.
+
+
+----------------------------------------------------------------
+STEP 2: CREATE THE VIRTUAL ENVIRONMENT
+----------------------------------------------------------------
+Run this command in the terminal to create the isolated space:
+
+    python -m venv venv
+
+
+----------------------------------------------------------------
+STEP 3: ACTIVATE THE ENVIRONMENT (IN TERMINAL)
+----------------------------------------------------------------
+Run this to activate the isolated mode in the current console:
+
+    .\venv\Scripts\Activate
+
+(If a red script error appears, run:
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
+and repeat the activation command).
+
+
+----------------------------------------------------------------
+STEP 4: LINK THE ENVIRONMENT TO VS CODE (IMPORTANT!)
+----------------------------------------------------------------
+For the "Play" button and autocomplete to work with the 
+libraries we are going to install, you must tell VS Code:
+
+1. Press the keys: Ctrl + Shift + P
+2. Type and select: Python: Select Interpreter
+3. In the list, find and select the option that says "venv"
+   (It usually appears with a star or says "Recommended").
+
+NOTE: If VS Code asks if you want to select it for the
+workspace, say YES.
+
+
+----------------------------------------------------------------
+STEP 5: INSTALL LIBRARIES
+----------------------------------------------------------------
+Now that VS Code and the terminal point to the correct location, install:
+
+>>> OPTION A (If you have requirements.txt):
+    pip install -r requirements.txt
+
+>>> OPTION B (Manual):
+    pip install flet pulp openpyxl highspy
+
+
+----------------------------------------------------------------
+STEP 6: SAVE CONFIGURATION (Only if you used Option B)
+----------------------------------------------------------------
+    pip freeze > requirements.txt
+
+
+----------------------------------------------------------------
+STEP 7: RUN THE PROGRAM
+----------------------------------------------------------------
+You can now hit the "Play" button in VS Code or type:
+
+    python main.py
+
+================================================================
+ END OF GUIDE
+================================================================
