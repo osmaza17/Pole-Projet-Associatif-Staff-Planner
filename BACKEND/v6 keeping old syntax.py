@@ -1,5 +1,47 @@
 import flet as ft
 from pulp import *
+import json
+from datetime import datetime
+
+
+
+
+
+def flat_to_nested(d, order=None):
+    """
+    Convierte un dict con tuplas como claves en dicts anidados.
+    
+    order: tupla con el orden deseado de los índices de la clave.
+           Ejemplo: si la clave es (p, t, h, j) y quieres j → p → h → t,
+           pasas order=(3, 0, 2, 1).
+           Si es None, mantiene el orden original.
+    """
+    result = {}
+    for key, val in d.items():
+        if order:
+            key = tuple(key[i] for i in order)
+        node = result
+        for k in key[:-1]:
+            node = node.setdefault(str(k), {})
+        node[str(key[-1])] = val
+    return result
+
+
+def nested_to_flat(d, prefix=()):
+    """
+    Convierte dicts anidados de vuelta a dict con tuplas como claves.
+    Ejemplo: {"Ana": {"Task1": {"09:00": {"Mon": 1}}}}  →  {("Ana","Task1","09:00","Mon"): 1}
+    """
+    result = {}
+    for k, v in d.items():
+        new_key = prefix + (k,)
+        if isinstance(v, dict):
+            result.update(nested_to_flat(v, new_key))
+        else:
+            result[new_key] = v
+    return result
+
+
 
 def solve_model(data):
 
@@ -240,6 +282,12 @@ def solve_model(data):
                 prev_work = lpSum(x[(p,t,h_prev,j)] for t in tasks)
                 
                 model += (r[(p, h_curr, j)] >= curr_work - prev_work, f"Start_{h_curr}_{p}_{j}")
+    
+    # IN CASE WE WANT NO GAPS BETWEEN TASKS, WE CAN ADD THIS
+    #for p in people:
+    #    for j in days:
+    #        # The sum of starts for person 'p' on day 'j' must be <= 1
+    #        model += lpSum(r[(p, h, j)] for h in hours) <= 1
 
 
     # ============================================================
@@ -249,7 +297,7 @@ def solve_model(data):
     solver = GUROBI(
         msg=True,          # Shows solver progress in console (nodes, gap,etc.)
         timeLimit=1200,    # Max execution seconds. If reached, returns the best solution found
-        gapRel=0.001,      # Max % difference between solution and theoretical bound to stop (0.01 = 1%)
+        gapRel=0.00001,      # Max % difference between solution and theoretical bound to stop (0.01 = 1%)
         mip=True,          # True=solves integer (binary/integer). False=ignores integrality, solves continuous LP
 
         # --- MIP Performance ---
@@ -568,7 +616,7 @@ def main(page: ft.Page):
         output_ct.controls.append(ft.Text(f"Status: {sol['status']}", weight=ft.FontWeight.BOLD, size=16))
         output_ct.controls.append(ft.Divider())
 
-        # Build task -> color map
+        # Build task -> color mapa
         tc = {}
         for i, t in enumerate(tasks):
             bg, fg = TASK_COLORS[i % len(TASK_COLORS)]
@@ -685,13 +733,14 @@ def main(page: ft.Page):
 
     # --- solve ---
     def do_solve(e):
-        people,tasks,hours,days = dims()
+        people, tasks, hours, days = dims()
 
         availability = {}
         for p in people:
             for h in hours:
                 for j in days:
                     availability[(p,h,j)] = avail_st.get((p,h,j), 1)
+        
         demand = {}
         for t in tasks:
             for h in hours:
@@ -699,37 +748,43 @@ def main(page: ft.Page):
                     raw = demand_st.get((t,h,j), "1")
                     try: demand[(t,h,j)] = int(raw)
                     except: demand[(t,h,j)] = 0
+        
         skills = {}
         for p in people:
             for t in tasks:
                 skills[(p,t)] = skills_st.get((p,t), 1)
+        
         force = {}
         for p in people:
             for t in tasks:
                 for h in hours:
                     for j in days:
                         force[(p,t,h,j)] = force_st.get((p,t,h,j), 0)
+        
         social = {}
         for i, p1 in enumerate(people):
             for p2 in people[i+1:]:
                 social[(p1,p2)] = social_st.get((p1,p2), 0)
+        
         mq = {}
         for p in people:
             for t in tasks:
                 raw = quota_st.get((p,t), "0")
                 try: mq[(p,t)] = int(raw)
                 except: mq[(p,t)] = 0
+        
         rotation = {t: rotation_st.get(t,1) for t in tasks}
         pref_cost = {(p,t): 1 for p in people for t in tasks}
         X_prev = {(p,t,h,j): 0 for p in people for t in tasks for h in hours for j in days}
+        
         weights = dict(W_COVERAGE=100000, W_MANDATE=50000, W_STABILITY=10000,
                        W_EQ_DAY=5000, W_EQ_TOTAL=1000, W_ROTATION=500,
                        W_SOCIAL=100, W_GAP=50, W_QUOTA=10, W_PREF=5)
 
-        data = dict(people=people,tasks=tasks,hours=hours,days=days,
+        data = dict(people=people, tasks=tasks, hours=hours, days=days,
                     availability=availability, demand=demand, skills=skills,
                     force=force, social=social, min_quota=mq,
-                    pref_cost=pref_cost,rotation=rotation, X_prev=X_prev, weights=weights)
+                    pref_cost=pref_cost, rotation=rotation, X_prev=X_prev, weights=weights)
 
         output_ct.controls.clear()
         output_ct.controls.append(ft.ProgressRing())
@@ -738,13 +793,57 @@ def main(page: ft.Page):
         page.update()
 
         try:
+            # 1. Solve the model
             sol = solve_model(data) 
-            build_output_grid(sol, people,tasks,hours,days, availability)
+
+            # ==========================================
+            # EXPORT TO JSON (Nested Dict Format)
+            # ==========================================
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            filename = f"schedule_{timestamp}.json"
+
+            export_data = {
+                "meta": {
+                    "timestamp": timestamp,
+                    "solver_status": sol.get("status", "Unknown")
+                },
+                "inputs": {
+                    "people": people,
+                    "tasks": tasks,
+                    "hours": hours,
+                    "days": days,
+                    #                                     Clave original → Orden en JSON
+                    "availability": flat_to_nested(availability, order=(2, 0, 1)),       # (p,h,j) → j → p → h
+                    "demand":       flat_to_nested(demand,       order=(2, 0, 1)),       # (t,h,j) → j → t → h
+                    "skills":       flat_to_nested(skills),                               # (p,t)   → p → t
+                    "force":        flat_to_nested(force,        order=(3, 0, 2, 1)),    # (p,t,h,j) → j → p → h → t
+                    "social":       flat_to_nested(social),                               # (p1,p2) → p1 → p2
+                    "min_quota":    flat_to_nested(mq),                                   # (p,t)   → p → t
+                    "pref_cost":    flat_to_nested(pref_cost),                            # (p,t)   → p → t
+                    "rotation":     rotation,
+                    "X_prev":       flat_to_nested(X_prev,       order=(3, 0, 2, 1)),    # (p,t,h,j) → j → p → h → t
+                    "weights":      weights,
+                },
+                "solution": sol
+            }
+
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(export_data, f, indent=4, ensure_ascii=False)
+
+            output_ct.controls.append(
+                ft.Text(f"Data saved to: {filename}",
+                        color=ft.Colors.GREEN, size=12, weight=ft.FontWeight.BOLD))
+            # ==========================================
+
+            # 2. Update UI
+            build_output_grid(sol, people, tasks, hours, days, availability)
+            
         except Exception as ex:
             output_ct.controls.clear()
             output_ct.controls.append(ft.Text(f"ERROR: {ex}", color=ft.Colors.RED_400, size=14))
             import traceback
             traceback.print_exc()
+        
         page.update()
 
     solve_btn = ft.ElevatedButton("SOLVE", on_click=do_solve,
