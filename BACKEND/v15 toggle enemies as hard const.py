@@ -10,15 +10,15 @@ from gurobipy import GRB
 DEFAULT_WEIGHTS = {
     "W_COVERAGE": 100000,
     "W_MANDATE": 50000,
-    "W_EMERG": 25000,
-    "W_STABILITY": 10000,
-    "W_EQ_DAY": 5000,
-    "W_EQ_TOTAL": 1000,
-    "W_GAP": 500,
-    "W_ROTATION": 100,
-    "W_SOCIAL": 50,
-    "W_QUOTA": 10,
-    "W_PREF": 5
+    "W_EMERG": 10000,
+    "W_STABILITY": 5000,
+    "W_EQ_DAY": 1000,
+    "W_EQ_TOTAL": 500,
+    "W_GAP": 100,
+    "W_ROTATION": 50,
+    "W_SOCIAL": 10,
+    "W_QUOTA": 5,
+    "W_PREF": 1
 }
 
 SORTED_VALUES = sorted(DEFAULT_WEIGHTS.values(), reverse=True)
@@ -30,7 +30,7 @@ CAPTAIN_FG = "#000000"
 # BACKEND: GUROBIPY MODEL
 # ============================================================
 
-def solve_model(data, ui_update_callback=None):
+def solve_model(data, ui_update_callback=None, active_model_ref=None):
     people = data["people"];    tasks = data["tasks"]
     hours  = data["hours"];     days  = data["days"]
     demand   = data["demand"];  availability = data["availability"]
@@ -43,6 +43,7 @@ def solve_model(data, ui_update_callback=None):
     enforced_rest = data.get("enforced_rest", False)
     max_consec_hours = data.get("max_consec_hours", None)
     captains = data.get("captains", [])
+    hard_enemies = data.get("hard_enemies", False)
 
     W_COVERAGE  = W["W_COVERAGE"];      W_MANDATE   = W["W_MANDATE"]
     W_EMERG     = W["W_EMERG"];         W_STABILITY = W["W_STABILITY"]
@@ -51,170 +52,266 @@ def solve_model(data, ui_update_callback=None):
     W_GAP       = W["W_GAP"];           W_QUOTA     = W["W_QUOTA"]
     W_PREF      = W["W_PREF"]
 
+    # =================================================================
+    # PRE-COMPUTED SETS & LOOKUPS
+    # =================================================================
+    avail_set = {(p,h,j) for (p,h,j), v in availability.items() if v == 1}
+    skill_set = {(p,t)   for (p,t),   v in skills.items()       if v == 1}
+
+    x_set = {(p,t,h,j) for p in people for t in tasks
+                   for h in hours for j in days
+                   if (p,t) in skill_set and (p,h,j) in avail_set}
+
+    h_next = {hours[i]: hours[i+1] for i in range(len(hours) - 1)}
+
+    friend_pairs = [(p1,p2) for (p1,p2), val in social.items() if val == 1]
+    enemy_pairs  = [(p1,p2) for (p1,p2), val in social.items() if val == -1]
+
+    # =================================================================
+    # MODEL
+    # =================================================================
     env = gp.Env(empty=True)
     env.setParam("OutputFlag", 1)
     env.start()
     model = gp.Model("StaffScheduler", env=env)
 
-    # Variables
-    x = model.addVars(people, tasks, hours, days, vtype=GRB.BINARY, name="x")
-    m = model.addVars(tasks, hours, days, lb=0, vtype=GRB.INTEGER, name="m")
-    u = model.addVars(people, tasks, hours, days, lb=0, vtype=GRB.INTEGER, name="u")
-    d = model.addVars(people, tasks, hours, days, vtype=GRB.BINARY, name="d")
-    q = model.addVars(people, tasks, vtype=GRB.BINARY, name="q")
-    r = model.addVars(people, hours, days, vtype=GRB.BINARY, name="r")
+    if active_model_ref is not None:
+        active_model_ref[0] = model
 
-    n_max = model.addVars(days, lb=0, vtype=GRB.INTEGER, name="n_max")
-    n_min = model.addVars(days, lb=0, vtype=GRB.INTEGER, name="n_min")
-    z_max = model.addVar(lb=0, vtype=GRB.INTEGER, name="z_max")
-    z_min = model.addVar(lb=0, vtype=GRB.INTEGER, name="z_min")
+    # =================================================================
+    # VARIABLES — x is the ONLY binary variable.
+    #             All auxiliaries are CONTINUOUS (integrality induced by x).
+    #             Each auxiliary is created ONLY over the keys where it matters.
+    # =================================================================
 
-    consec_keys = [(p,t,h,j) for p in people for t in tasks for h in hours[:-1] for j in days if rotation.get(t, 0) == 1]
-    c = model.addVars(consec_keys, vtype=GRB.BINARY, name="c")
+    # --- Core assignment: person p does task t at hour h on day j ----------
+    x = model.addVars(x_set, vtype=GRB.BINARY, name="x")
 
-    friend_pairs = [(p1,p2) for (p1,p2), val in social.items() if val == 1]
-    enemy_pairs  = [(p1,p2) for (p1,p2), val in social.items() if val == -1]
-    v = model.addVars(friend_pairs, tasks, hours, days, vtype=GRB.BINARY, name="v")
-    w = model.addVars(enemy_pairs, tasks, hours, days, vtype=GRB.BINARY, name="w")
+    # --- Missing staff: how many slots of (t,h,j) are unfilled -------------
+    m = model.addVars(tasks, hours, days, lb=0, vtype=GRB.CONTINUOUS, name="m")
 
-    k = model.addVars(hours, days, vtype=GRB.BINARY, name="k")
+    # --- Unfulfilled mandates: created for EVERY force=1 entry -------------
+    force_keys = [(p,t,h,j) for (p,t,h,j), val in force.items() if val == 1]
+    u = model.addVars(force_keys, lb=0, vtype=GRB.CONTINUOUS, name="u")
 
-    # Objective
+    # --- Deviation from previous plan: only where x can exist ---------------
+    d = model.addVars(x_set, lb=0, vtype=GRB.CONTINUOUS, name="d")
+
+    # --- Quota miss: only for (p,t) pairs with a positive quota wish --------
+    quota_keys = [(p,t) for p in people for t in tasks
+                  if min_quota.get((p,t), 0) > 0]
+    q = model.addVars(quota_keys, lb=0, vtype=GRB.CONTINUOUS, name="q")
+
+    # --- Work restarts (gap detection): only where person is available ------
+    r_keys = [(p,h,j) for p in people for h in hours for j in days
+              if (p,h,j) in avail_set]
+    r = model.addVars(r_keys, lb=0, vtype=GRB.CONTINUOUS, name="r")
+
+    # --- Equity bounds ------------------------------------------------------
+    n_max = model.addVars(days, lb=0, ub=len(hours), vtype=GRB.CONTINUOUS, name="n_max")
+    n_min = model.addVars(days, lb=0, ub=len(hours), vtype=GRB.CONTINUOUS, name="n_min")
+    z_max = model.addVar(lb=0, ub=len(hours) * len(days), vtype=GRB.CONTINUOUS, name="z_max")
+    z_min = model.addVar(lb=0, ub=len(hours) * len(days), vtype=GRB.CONTINUOUS, name="z_min")
+
+    # --- Consecutive penalty: rotation=1 AND both hours have valid x --------
+    consec_keys = [(p,t,h,j) for p in people for t in tasks
+                   for h in hours[:-1] for j in days
+                   if rotation.get(t, 0) == 1
+                   and (p,t,h,j) in x_set
+                   and (p,t,h_next[h],j) in x_set]
+    c = model.addVars(consec_keys, lb=0, vtype=GRB.CONTINUOUS, name="c")
+
+    # --- Friends separation: only where BOTH friends can work ---------------
+    v_keys = [(p1,p2,t,h,j) for p1,p2 in friend_pairs for t in tasks
+              for h in hours for j in days
+              if (p1,t,h,j) in x_set and (p2,t,h,j) in x_set]
+    v = model.addVars(v_keys, lb=0, vtype=GRB.CONTINUOUS, name="v")
+
+    # --- Enemies together: only where BOTH enemies can work -----------------
+    enemy_scope = [(p1,p2,t,h,j) for p1,p2 in enemy_pairs for t in tasks
+                   for h in hours for j in days
+                   if (p1,t,h,j) in x_set and (p2,t,h,j) in x_set]
+    if hard_enemies:
+        w_keys = []
+    else:
+        w_keys = enemy_scope
+        w = model.addVars(w_keys, lb=0, vtype=GRB.CONTINUOUS, name="w")
+
+    # --- Captain slack: only if captains exist, only active hours -----------
+    active_hj = []
+    if captains:
+        active_hj = [(h,j) for h in hours for j in days
+                     if sum(demand.get((t,h,j), 0) for t in tasks) > 0]
+        k = model.addVars(active_hj, lb=0, vtype=GRB.CONTINUOUS, name="k")
+
+    # =================================================================
+    # OBJECTIVE
+    # =================================================================
     obj = gp.LinExpr()
+
     obj += W_COVERAGE * m.sum()
-    obj += W_MANDATE * u.sum()
-    obj += W_MANDATE * k.sum()
-    
-    for p in people:
-        for t in tasks:
-            for h in hours:
-                for j in days:
-                    obj += W_EMERG * emergency.get((p,h,j), 0) * x[p,t,h,j]
-                    obj += W_PREF * pref_cost.get((p,t), 0) * x[p,t,h,j]
-                    
+    obj += W_MANDATE  * u.sum()
+
+    if captains:
+        obj += W_MANDATE * k.sum()
+
+    obj += W_EMERG * gp.quicksum(
+        emergency.get((p,h,j), 0) * x[p,t,h,j]
+        for p,t,h,j in x_set)
+
+    obj += W_PREF * gp.quicksum(
+        pref_cost.get((p,t), 0) * x[p,t,h,j]
+        for p,t,h,j in x_set)
+
     obj += W_STABILITY * d.sum()
+
     for j in days:
         obj += W_EQ_DAY * (n_max[j] - n_min[j])
         
     obj += W_EQ_TOTAL * (z_max - z_min)
-    
-    if consec_keys: obj += W_ROTATION * c.sum()
-    if friend_pairs: obj += W_SOCIAL * v.sum()
-    if enemy_pairs: obj += W_SOCIAL * w.sum()
-    
-    obj += W_GAP * r.sum()
+
+    if consec_keys:
+        obj += W_ROTATION * c.sum()
+
+    if v_keys:
+        obj += W_SOCIAL * v.sum()
+
+    if w_keys:
+        obj += W_SOCIAL * w.sum()
+
+    obj += W_GAP   * r.sum()
     obj += W_QUOTA * q.sum()
 
     model.setObjective(obj, GRB.MINIMIZE)
 
-    # Constraints
+    # =================================================================
+    # CONSTRAINTS
+    # =================================================================
+
+    # A. DEMAND COVERAGE
     for t in tasks:
         for h in hours:
             for j in days:
-                model.addConstr(x.sum('*', t, h, j) + m[t,h,j] == demand.get((t,h,j),0))
+                model.addConstr(x.sum('*', t, h, j) + m[t,h,j] == demand.get((t,h,j), 0))
 
-    for p in people:
-        for t in tasks:
-            for h in hours:
-                for j in days:
-                    if force.get((p,t,h,j), 0) == 1:
-                        model.addConstr(1 - x[p,t,h,j] <= u[p,t,h,j])
+    # B.1. MANDATED TASKS (soft)
+    model.addConstrs(
+        (1 - x[p,t,h,j] <= u[p,t,h,j]
+         for p,t,h,j in force_keys if (p,t,h,j) in x_set),
+        name="mandate_valid")
+    
+    model.addConstrs(
+        (u[p,t,h,j] >= 1
+         for p,t,h,j in force_keys if (p,t,h,j) not in x_set),
+        name="mandate_impossible")
 
+    # B.2. CAPTAINS (soft)
     if captains:
-        for j in days:
-            for h in hours:
-                if sum(demand.get((t,h,j), 0) for t in tasks) > 0:
-                    model.addConstr(gp.quicksum(x[p,t,h,j] for p in captains for t in tasks) + k[h,j] >= 1)
+        for h,j in active_hj:
+            model.addConstr(
+                gp.quicksum(x.sum(p, '*', h, j) for p in captains) + k[h,j] >= 1)
 
+    # C. ANTI-UBIQUITY (max 1 task per available person-hour)
     for p in people:
         for h in hours:
             for j in days:
-                if availability.get((p,h,j), 0) == 0:
-                    model.addConstr(x.sum(p, '*', h, j) == 0)
-                else:
+                if (p,h,j) in avail_set:
                     model.addConstr(x.sum(p, '*', h, j) <= 1)
 
-    for p in people:
-        for t in tasks:
-            if skills.get((p,t), 0) == 0:
-                model.addConstrs((x[p,t,h,j] == 0 for h in hours for j in days))
+    # E. EQUITY — Daily bounds (only people available that day)
+    for j in days:
+        people_avail_j = [p for p in people
+                          if any((p,h,j) in avail_set for h in hours)]
+        for p in people_avail_j:
+            model.addConstr(x.sum(p, '*', '*', j) <= n_max[j])
+            model.addConstr(x.sum(p, '*', '*', j) >= n_min[j])
 
+    # E. EQUITY — Global bounds (only people with any availability)
+    people_with_avail = [p for p in people
+                         if any((p,h,j) in avail_set for h in hours for j in days)]
+    for p in people_with_avail:
+        model.addConstr(x.sum(p, '*', '*', '*') <= z_max)
+        model.addConstr(x.sum(p, '*', '*', '*') >= z_min)
+
+    # F. ROTATION FATIGUE — batch
+    model.addConstrs(
+        (x[p,t,h,j] + x[p,t,h_next[h],j] - c[p,t,h,j] <= 1
+         for p,t,h,j in consec_keys),
+        name="rotation")
+
+    # G. SOCIAL — Friends (both can work → penalize separation)
+    if v_keys:
+        model.addConstrs(
+            (x[p1,t,h,j] - x[p2,t,h,j] <= v[p1,p2,t,h,j]
+             for p1,p2,t,h,j in v_keys),
+            name="friends_a")
+        model.addConstrs(
+            (x[p2,t,h,j] - x[p1,t,h,j] <= v[p1,p2,t,h,j]
+             for p1,p2,t,h,j in v_keys),
+            name="friends_b")
+
+    # G. SOCIAL — Enemies (both can work → penalize togetherness)
+    if hard_enemies:
+        model.addConstrs(
+            (x[p1,t,h,j] + x[p2,t,h,j] <= 1
+             for p1,p2,t,h,j in enemy_scope),
+            name="enemies_hard")
+    elif w_keys:
+        model.addConstrs(
+            (x[p1,t,h,j] + x[p2,t,h,j] - w[p1,p2,t,h,j] <= 1
+             for p1,p2,t,h,j in w_keys),
+            name="enemies")
+
+    # H. MINIMUM QUOTA (per day)
+    for p,t in quota_keys:
+        for j in days:
+            target = min(min_quota.get((p,t), 0), len(hours))
+            if target > 0:
+                model.addConstr(x.sum(p, t, '*', j) + q[p,t] >= target)
+
+    # I. STABILITY / DEVIATION — batch
+    model.addConstrs(
+        (d[p,t,h,j] >= X_prev.get((p,t,h,j), 0) - x[p,t,h,j]
+         for p,t,h,j in x_set),
+        name="dev_a")
+    model.addConstrs(
+        (d[p,t,h,j] >= x[p,t,h,j] - X_prev.get((p,t,h,j), 0)
+         for p,t,h,j in x_set),
+        name="dev_b")
+
+    # J.1. GAP DETECTION (work restarts)
     for j in days:
         for p in people:
-            daily_hours = x.sum(p, '*', '*', j)
-            model.addConstr(daily_hours <= n_max[j])
-            model.addConstr(daily_hours >= n_min[j])
-
-    for p in people:
-        total_hours = x.sum(p, '*', '*', '*')
-        model.addConstr(total_hours <= z_max)
-        model.addConstr(total_hours >= z_min)
-
-    for (p,t,h,j) in consec_keys:
-        next_h = hours[hours.index(h) + 1]
-        model.addConstr(x[p,t,h,j] + x[p,t,next_h,j] - c[p,t,h,j] <= 1)
-
-    for (p1, p2) in friend_pairs:
-        for t in tasks:
-            for h in hours:
-                for j in days:
-                    model.addConstr(x[p1,t,h,j] - x[p2,t,h,j] <= v[p1,p2,t,h,j])
-                    model.addConstr(x[p2,t,h,j] - x[p1,t,h,j] <= v[p1,p2,t,h,j])
-
-    for (p1, p2) in enemy_pairs:
-        for t in tasks:
-            for h in hours:
-                for j in days:
-                    model.addConstr(x[p1,t,h,j] + x[p2,t,h,j] - w[p1,p2,t,h,j] <= 1)
-
-    for p in people:
-        for t in tasks:
-            for j in days:
-                target = min(min_quota.get((p,t), 0), len(hours))
-                if target > 0:
-                    model.addConstr(x.sum(p, t, '*', j) + q[p,t] >= target)
-
-    for p in people:
-        for t in tasks:
-            for h in hours:
-                for j in days:
-                    prev = X_prev.get((p,t,h,j), 0)
-                    model.addConstr(d[p,t,h,j] >= prev - x[p,t,h,j])
-                    model.addConstr(d[p,t,h,j] >= x[p,t,h,j] - prev)
-
-    for j in days:
-        for p in people:
-            model.addConstr(r[p, hours[0], j] == x.sum(p, '*', hours[0], j))
+            if (p, hours[0], j) in avail_set:
+                model.addConstr(r[p, hours[0], j] == x.sum(p, '*', hours[0], j))
             for i in range(1, len(hours)):
                 h_curr = hours[i]; h_prev = hours[i-1]
-                model.addConstr(r[p, h_curr, j] >= x.sum(p, '*', h_curr, j) - x.sum(p, '*', h_prev, j))
+                if (p, h_curr, j) in avail_set:
+                    model.addConstr(
+                        r[p, h_curr, j] >= x.sum(p, '*', h_curr, j) - x.sum(p, '*', h_prev, j))
 
+    # J.2. ENFORCED REST (sliding window)
     if enforced_rest and max_consec_hours is not None:
         Y = max_consec_hours
         for j in days:
             for p in people:
                 for i in range(len(hours) - Y):
-                    window_hours = hours[i:i+Y+1]
-                    model.addConstr(gp.quicksum(x[p,t,tau,j] for t in tasks for tau in window_hours) <= Y)
+                    window = hours[i:i+Y+1]
+                    model.addConstr(
+                        gp.quicksum(x.sum(p, '*', tau, j) for tau in window) <= Y)
 
-    # Attach variables to model object so callback can access them
-# ============================================================
-    # 5. SOLVER PARAMETERS & CALLBACK
-    # ============================================================
+    # =================================================================
+    # SOLVER CONFIG & OPTIMIZE
+    # =================================================================
     model._x = x
-    model.setParam('TimeLimit', 1200)
-    model.setParam('MIPGap', 0.01)
-    
-    # --- Threads & Focus ---
-    model.setParam('Threads', 1)
-    model.setParam('MIPFocus', 2)
-    
-    # --- Restored Aggressive Tuning ---
-    model.setParam('Presolve', 2)          # Aggressive presolve
-    model.setParam('Symmetry', 2)          # Aggressive symmetry breaking
-    model.setParam('Disconnected', 2)      # Detect independent subproblems
-    model.setParam('IntegralityFocus', 1)  # Strives harder for exact integers
-    model.setParam('Method', 1)            # Dual simplex
+    model._x_set = x_set
+
+    solver_params = data.get("solver_params", {})
+    for param_name, param_value in solver_params.items():
+        try:
+            model.setParam(param_name, param_value)
+        except Exception as e:
+            print(f"Warning: Could not set param {param_name}={param_value}: {e}")
 
     def intermediate_solution_callback(model, where):
         if where == GRB.Callback.MIPSOL:
@@ -227,30 +324,32 @@ def solve_model(data, ui_update_callback=None):
                             for h in hours:
                                 assigned_task = None
                                 for t in tasks:
-                                    if x_vals[p,t,h,j] > 0.5:
-                                        assigned_task = t
-                                        break
+                                    if (p,t,h,j) in model._x_set and x_vals[p,t,h,j] > 0.5:
+                                        assigned_task = t; break
                                 temp_assignment[j][p][h] = assigned_task
-                    
-                    # Package it as a partial solution
                     partial_sol = {
                         "status": "Solving (New Best Found)...",
-                        "assignment": temp_assignment
-                    }
+                        "assignment": temp_assignment}
                     ui_update_callback(partial_sol)
-                except Exception as e:
-                    pass # Ignore errors during callback extraction
+                except Exception:
+                    pass
 
     model.optimize(intermediate_solution_callback)
 
-    # Extract final results
+    # =================================================================
+    # EXTRACT FINAL RESULTS
+    # =================================================================
     sol = {}
-    status_map = {GRB.OPTIMAL: "Optimal", GRB.TIME_LIMIT: "Time Limit Reached", GRB.INFEASIBLE: "Infeasible"}
+    status_map = {
+        GRB.OPTIMAL:     "Optimal",
+        GRB.TIME_LIMIT:  "Time Limit Reached",
+        GRB.INFEASIBLE:  "Infeasible",
+        GRB.INTERRUPTED: "Interrupted by User"}
     sol["status"] = status_map.get(model.Status, f"Status Code: {model.Status}")
     sol["enforced_rest"] = enforced_rest
-    
+
     if model.SolCount == 0:
-        raise Exception("No feasible solution was found.")
+        raise Exception("No feasible solution was found before stopping/timeout.")
 
     assignment = {}
     for j in days:
@@ -260,7 +359,7 @@ def solve_model(data, ui_update_callback=None):
             for h in hours:
                 assigned_task = None
                 for t in tasks:
-                    if x[p,t,h,j].X > 0.5:
+                    if (p,t,h,j) in x_set and x[p,t,h,j].X > 0.5:
                         assigned_task = t; break
                 assignment[j][p][h] = assigned_task
     sol["assignment"] = assignment
@@ -270,12 +369,14 @@ def solve_model(data, ui_update_callback=None):
         for h in hours:
             for j in days:
                 val = m[t,h,j].X
-                if val > 0.01: missing.append(f"{t} @ {h}, {j}: {val:.0f} missing")
+                if val > 0.01:
+                    missing.append(f"{t} @ {h}, {j}: {val:.0f} missing")
     sol["missing"] = missing
 
     workload = {}
     for p in people:
-        total_hrs = sum(x[p,t,h,j].X for t in tasks for h in hours for j in days if x[p,t,h,j].X > 0.5)
+        total_hrs = sum(1 for t in tasks for h in hours for j in days
+                        if (p,t,h,j) in x_set and x[p,t,h,j].X > 0.5)
         workload[p] = total_hrs
     sol["workload"] = workload
     sol["z_max"] = z_max.X; sol["z_min"] = z_min.X
@@ -286,10 +387,11 @@ def solve_model(data, ui_update_callback=None):
         for p in people:
             starts_count = 0; start_times = []
             for h in hours:
-                if r[p,h,j].X > 0.5: 
+                if (p,h,j) in avail_set and r[p,h,j].X > 0.5:
                     starts_count += 1; start_times.append(h)
-            if starts_count > 1: 
-                day_gaps_found.append(f"  • {p}: {starts_count} blocks (Starts: {', '.join(start_times)})")
+            if starts_count > 1:
+                day_gaps_found.append(
+                    f"  • {p}: {starts_count} blocks (Starts: {', '.join(start_times)})")
         if day_gaps_found:
             gaps.append(f"--- {j} ---")
             gaps.extend(day_gaps_found)
@@ -301,29 +403,27 @@ def solve_model(data, ui_update_callback=None):
             for t in tasks:
                 for h in hours:
                     for j in days:
-                        if x[p1,t,h,j].X > 0.5 and x[p2,t,h,j].X > 0.5:
-                            soc_issues.append(f"MATCH: Friends {p1} & {p2} together @ {t}, {h}, {j}")
-
+                        p1_w = (p1,t,h,j) in x_set and x[p1,t,h,j].X > 0.5
+                        p2_w = (p2,t,h,j) in x_set and x[p2,t,h,j].X > 0.5
+                        if p1_w and p2_w:
+                            soc_issues.append(
+                                f"MATCH: Friends {p1} & {p2} together @ {t}, {h}, {j}")
     if enemy_pairs:
         enemy_violations = 0
-        for (p1,p2) in enemy_pairs:
-            for t in tasks:
-                for h in hours:
-                    for j in days:
-                        if w[p1,p2,t,h,j].X > 0.5: 
-                            soc_issues.append(f"VIOLATION: Enemies {p1} & {p2} together @ {t}, {h}, {j}")
-                            enemy_violations += 1
+        for p1,p2,t,h,j in w_keys:
+            if w[p1,p2,t,h,j].X > 0.5:
+                soc_issues.append(
+                    f"VIOLATION: Enemies {p1} & {p2} together @ {t}, {h}, {j}")
+                enemy_violations += 1
         if enemy_violations == 0:
             soc_issues.append("SUCCESS: All enemies successfully separated (0 violations).")
     sol["social_issues"] = soc_issues
 
     captain_issues = []
     if captains:
-        for j in days:
-            for h in hours:
-                if sum(demand.get((t,h,j), 0) for t in tasks) > 0:
-                    if k[h,j].X > 0.5:
-                        captain_issues.append(f"MISSING CAPTAIN @ {h}, {j}")
+        for h,j in active_hj:
+            if k[h,j].X > 0.5:
+                captain_issues.append(f"MISSING CAPTAIN @ {h}, {j}")
         if not captain_issues:
             captain_issues.append("SUCCESS: All active hours have at least one captain on duty.")
     sol["captain_issues"] = captain_issues
@@ -334,9 +434,24 @@ def solve_model(data, ui_update_callback=None):
             for j in days:
                 if emergency.get((p,h,j), 0) == 1:
                     for t in tasks:
-                        if x[p,t,h,j].X > 0.5:
+                        if (p,t,h,j) in x_set and x[p,t,h,j].X > 0.5:
                             emerg_issues.append(f"EMERGENCY CALL-IN: {p} @ {t}, {h}, {j}")
     sol["emerg_issues"] = emerg_issues
+
+    rotation_issues = []
+    for p in people:
+        for t in tasks:
+            if rotation.get(t, 0) == 1:
+                for j in days:
+                    for i in range(len(hours) - 1):
+                        h_curr = hours[i]; h_nxt = h_next[h_curr]
+                        if ((p,t,h_curr,j) in x_set and x[p,t,h_curr,j].X > 0.5 and
+                            (p,t,h_nxt,j)  in x_set and x[p,t,h_nxt,j].X  > 0.5):
+                            rotation_issues.append(
+                                f"CONSECUTIVE: {p} doing '{t}' at {h_curr} & {h_nxt}, {j}")
+    if not rotation_issues:
+        rotation_issues.append("SUCCESS: No consecutive hours on rotation tasks.")
+    sol["rotation_issues"] = rotation_issues
 
     return sol
 
@@ -350,8 +465,9 @@ TASK_COLORS = [
     ("#A5D6A7", "#000000"), ("#FFAB91", "#000000"), ("#90CAF9", "#000000"),
     ("#F48FB1", "#000000"), ("#E6EE9C", "#000000"), ("#B0BEC5", "#000000"),
 ]
-UNAVAIL_COLOR = "#ED97B5"
-EMERG_COLOR = "#FF9800"
+UNAVAIL_COLOR = "#FF015A"
+EMERG_COLOR = "#FF9D0B"
+AVAIL_COLOR = "#0AFF16"
 
 def main(page: ft.Page):
     page.title = "Staff Scheduler"
@@ -362,15 +478,31 @@ def main(page: ft.Page):
     avail_st,demand_st,skills_st = {}, {}, {}
     force_st,social_st,quota_st,rotation_st = {}, {}, {}, {}
     captains_st = {}
+    hard_enemies_st = [False]
     
+    running_model_ref = [None]
+    ui_lock = threading.Lock()
+    
+    solver_params_st = {
+        "TimeLimit": 1200,
+        "MIPGap": 0.01,
+        "MIPFocus": 2,
+        "Threads": 0,
+        "Presolve": 2,
+        "Symmetry": 2,
+        "Disconnected": 2,
+        "IntegralityFocus": 1,
+        "Method": 3
+    }
+
     weights_st = DEFAULT_WEIGHTS.copy()
     weights_order = list(DEFAULT_WEIGHTS.keys()) 
     weights_enabled = {k: True for k in DEFAULT_WEIGHTS.keys()}
 
     tf_people = ft.TextField(
-        value="Christopher\nBrooklyn\nEzekiel\nBella\nMiles\nClaire\nJaxon\nSkylar", multiline=True, min_lines=8, max_lines=200, label="People (one per line)", expand=True)
+        value="Arnaud\nNina\nJoseph\nChloé\nNiels\nZiad\nTristan\nJasmin\nMarine\nNoé\nJules R\nGuillaume\nNoémie\nStanislas\nTérence\nManon In\nManon L\nPauline\nLucie\nDarius\nMattia\nPierre\nBaptiste B\nVincent\nMadeleine\nIlhan\nMatteo\nAlexandre L\nPablo\nJenaya\nLiv\nFaustin\nKenza\nJuliette B\nSarah\nAlexandre B\nRémi\nGabi\nJeanne B\nMatthieu A\nInès\nMaxime N\nAriane\nMatthias", multiline=True, min_lines=8, max_lines=200, label="People (one per line)", expand=True)
     tf_tasks = ft.TextField(
-        value="Buy Milk\nMeditate\nPlan Week", multiline=True, min_lines=8, max_lines=200, label="Tasks (one per line)", expand=True)
+        value="Pénélope\nAugustin B\nAgathe\nRafael\nLuna\nLéna\nCamille\nJuliette M\nPaul\nManon P\nMatthieu G\nAlix\nNadim\nJean-Louis\nArthur", multiline=True, min_lines=8, max_lines=200, label="Tasks (one per line)", expand=True)
     tf_hours = ft.TextField(
         value="08:00\n09:00\n10:00\n11:00\n12:00\n13:00\n14:00\n15:00\n16:00\n17:00", multiline=True, min_lines=8, max_lines=200, label="Hours (one per line)", expand=True)
     tf_days = ft.TextField(
@@ -379,8 +511,9 @@ def main(page: ft.Page):
     captains_col = ft.ListView(expand=True, spacing=4)
 
     def build_captains_list(e=None):
-        people = [x.strip() for x in tf_people.value.split("\n") if x.strip()]
+        people = list(dict.fromkeys(x.strip() for x in tf_people.value.split("\n") if x.strip()))
         captains_col.controls.clear()
+        page.update()
         captains_col.controls.append(ft.Text("Captains", weight=ft.FontWeight.BOLD, size=12))
         for p in people:
             if p not in captains_st:
@@ -419,10 +552,10 @@ def main(page: ft.Page):
 
     def dims():
         return (
-            [x.strip() for x in tf_people.value.split("\n") if x.strip()],
-            [x.strip() for x in tf_tasks.value.split("\n") if x.strip()],
-            [x.strip() for x in tf_hours.value.split("\n") if x.strip()],
-            [x.strip() for x in tf_days.value.split("\n") if x.strip()],
+            list(dict.fromkeys(x.strip() for x in tf_people.value.split("\n") if x.strip())),
+            list(dict.fromkeys(x.strip() for x in tf_tasks.value.split("\n") if x.strip())),
+            list(dict.fromkeys(x.strip() for x in tf_hours.value.split("\n") if x.strip())),
+            list(dict.fromkeys(x.strip() for x in tf_days.value.split("\n") if x.strip())),
         )
 
     avail_ct    = ft.ListView(expand=True, spacing=5)
@@ -433,6 +566,7 @@ def main(page: ft.Page):
     quota_ct    = ft.ListView(expand=True, spacing=5)
     rotation_ct = ft.ListView(expand=True, spacing=5)
     weights_ct  = ft.ListView(expand=True, spacing=5)
+    params_ct   = ft.ListView(expand=True, spacing=5)
     output_ct   = ft.ListView(expand=True, spacing=5)
 
     W_LBL = 90; W_BTN = 58; W_CELL = 65
@@ -485,6 +619,7 @@ def main(page: ft.Page):
 
     def build_avail():
         people,tasks,hours,days = dims(); avail_ct.controls.clear()
+        page.update()
         def _rand_avail(e):
             for p in people:
                 for h in hours:
@@ -513,6 +648,7 @@ def main(page: ft.Page):
 
     def build_demand():
         people,tasks,hours,days = dims(); demand_ct.controls.clear()
+        page.update()
         def _rand_demand(e):
             for t in tasks:
                 for h in hours:
@@ -538,6 +674,7 @@ def main(page: ft.Page):
 
     def build_skills():
         people,tasks,hours,days = dims(); skills_ct.controls.clear()
+        page.update()
         def _rand_skills(e):
             for p in people:
                 for t in tasks: skills_st[(p,t)] = random.choice([0, 1])
@@ -551,6 +688,7 @@ def main(page: ft.Page):
 
     def build_force():
         people,tasks,hours,days = dims(); force_ct.controls.clear()
+        page.update()
         for t in tasks:
             for j in days:
                 force_ct.controls.append(ft.Text(f"-- {t} / {j} --", weight=ft.FontWeight.BOLD, size=14))
@@ -562,6 +700,7 @@ def main(page: ft.Page):
 
     def build_social():
         people,tasks,hours,days = dims(); social_ct.controls.clear()
+        page.update()
         if len(people) < 2: page.update(); return
         def _rand_social(e):
             for i, p1 in enumerate(people):
@@ -569,6 +708,13 @@ def main(page: ft.Page):
             build_social()
             
         social_ct.controls.append(ft.Container(content=ft.Text("Random Social", color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD), bgcolor=ft.Colors.PURPLE_400, padding=10, border_radius=4, on_click=_rand_social, width=150, alignment=ft.alignment.center))
+
+        sw_hard_enemies = ft.Switch(label="Enemies: Hard Constraint", value=hard_enemies_st[0])
+        def _toggle_hard_enemies(e): hard_enemies_st[0] = e.control.value
+        sw_hard_enemies.on_change = _toggle_hard_enemies
+
+        social_ct.controls.append(ft.Row([sw_hard_enemies], spacing=20))
+
         social_ct.controls.append(hdr_row(people[1:], 70))
         _map_lbl = {0: "~", 1: "+", -1: "-"}; _map_clr = {0: ft.Colors.GREY_400, 1: ft.Colors.GREEN_400, -1: ft.Colors.RED_400}
         _next_val = {0: 1, 1: -1, -1: 0}
@@ -594,6 +740,7 @@ def main(page: ft.Page):
 
     def build_quota():
         people,tasks,hours,days = dims(); quota_ct.controls.clear()
+        page.update()
         quota_ct.controls.append(hdr_row(tasks,70))
         for p in people:
             cells = []
@@ -608,6 +755,7 @@ def main(page: ft.Page):
 
     def build_rotation():
         people,tasks,hours,days = dims(); rotation_ct.controls.clear()
+        page.update()
         for t in tasks:
             if t not in rotation_st: rotation_st[t] = 1
             sw = ft.Switch(label=t,value=rotation_st[t]==1, data=t)
@@ -621,6 +769,7 @@ def main(page: ft.Page):
             weights_st[key] = SORTED_VALUES[i] if weights_enabled[key] else 0
 
         weights_ct.controls.clear()
+        page.update()
         header = ft.Column([
             ft.Text("Priority Ranking", weight=ft.FontWeight.BOLD, size=16),
             ft.Text("Drag items to reorder. Top items = Higher Cost.", italic=True, size=12),
@@ -655,17 +804,36 @@ def main(page: ft.Page):
         weights_ct.controls.append(ft.Row([layout], alignment=ft.MainAxisAlignment.CENTER))
         page.update()
 
+    def build_params():
+        params_ct.controls.clear()
+        page.update()
+        params_ct.controls.append(ft.Text("Gurobi Solver Parameters", weight=ft.FontWeight.BOLD, size=16))
+        params_ct.controls.append(ft.Divider())
+        
+        for key, val in solver_params_st.items():
+            tf = ft.TextField(label=key, value=str(val), width=250, height=45, text_size=13)
+            def _ch(e, _k=key):
+                try:
+                    new_val = float(e.control.value) if "." in e.control.value else int(e.control.value)
+                    solver_params_st[_k] = new_val
+                except ValueError:
+                    pass
+            tf.on_change = _ch
+            params_ct.controls.append(tf)
+        page.update()
+
     builders = {1: build_avail, 2: build_demand, 3: build_skills,
-                4: build_force, 5: build_social, 6: build_quota, 7: build_rotation, 8: build_weights}
+                4: build_force, 5: build_social, 6: build_quota, 7: build_rotation, 8: build_weights, 9: build_params}
 
     def on_tab_change(e):
         idx = e.control.selected_index
-        if idx in builders: builders[idx]()
+        if idx in builders:
+            with ui_lock:
+                builders[idx]()
 
     def build_output_grid(sol, people, tasks, hours, days, availability, emergency):
         output_ct.controls.clear()
         
-        # Use .get() extensively to prevent crashes on partial solutions
         status = sol.get("status", "Solving...")
         assignment = sol.get("assignment", {})
         missing_issues = sol.get("missing", [])
@@ -674,6 +842,7 @@ def main(page: ft.Page):
         soc_issues = sol.get("social_issues", [])
         cap_issues = sol.get("captain_issues", [])
         emerg_issues = sol.get("emerg_issues", [])
+        rot_issues = sol.get("rotation_issues", [])
 
         output_ct.controls.append(ft.Text(f"Status: {status}", weight=ft.FontWeight.BOLD, size=16))
         output_ct.controls.append(ft.Divider())
@@ -683,7 +852,7 @@ def main(page: ft.Page):
         CW = 75; Ch = 36; NW = 110; TW = 50
         
         for j in days:
-            if j not in assignment: continue # Skip if partial data hasn't rendered this day yet
+            if j not in assignment: continue 
             output_ct.controls.append(ft.Text(f"-- {j} --", weight=ft.FontWeight.BOLD, size=16))
             hdr = [ft.Container(ft.Text("Person", size=11, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE), width=NW, height=Ch,bgcolor="#455A64", alignment=ft.alignment.center, border=ft.border.all(1, "#37474F"))]
             for h in hours: hdr.append(ft.Container(ft.Text(h,size=11, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE), width=CW, height=Ch,bgcolor="#455A64", alignment=ft.alignment.center, border=ft.border.all(1, "#37474F")))
@@ -704,7 +873,7 @@ def main(page: ft.Page):
                     
                     if avail == 0: brd = ft.border.all(0.5, UNAVAIL_COLOR)
                     elif griev == 1: brd = ft.border.all(0.5, EMERG_COLOR)
-                    else: brd = ft.border.all(0.5, ft.Colors.GREEN_400)
+                    else: brd = ft.border.all(0.5, AVAIL_COLOR)
                     
                     if task: 
                         bg, fg = tc[task]; total += 1
@@ -722,11 +891,9 @@ def main(page: ft.Page):
             output_ct.controls.append(ft.Row(legend_items, spacing=8))
             output_ct.controls.append(ft.Divider())
 
-        # If it's a partial solution during solve, we stop rendering here
         if "Solving" in status:
             return
 
-        # Render Final Stats
         output_ct.controls.append(ft.Text("MISSING STAFF", weight=ft.FontWeight.BOLD, size=14))
         if missing_issues:
             for line in missing_issues: output_ct.controls.append(ft.Text(f"  {line}", size=12))
@@ -741,6 +908,11 @@ def main(page: ft.Page):
             if gaps:
                 for line in gaps: output_ct.controls.append(ft.Text(f"  {line}", size=12))
             else: output_ct.controls.append(ft.Text("  Single block shifts! (Perfect)", size=12, italic=True))
+
+        output_ct.controls.append(ft.Text("ROTATION FATIGUE", weight=ft.FontWeight.BOLD, size=14))
+        if rot_issues:
+            for line in rot_issues: output_ct.controls.append(ft.Text(f"  {line}", size=12))
+        else: output_ct.controls.append(ft.Text("  No rotation tasks defined.", size=12, italic=True))
             
         output_ct.controls.append(ft.Text("SOCIAL", weight=ft.FontWeight.BOLD, size=14))
         if soc_issues:
@@ -819,40 +991,56 @@ def main(page: ft.Page):
                     force=force, social=social, min_quota=mq,
                     pref_cost=pref_cost, rotation=rotation, X_prev=X_prev, weights=weights,
                     enforced_rest=enforced_rest, max_consec_hours=max_consec_hours,
-                    captains=captains)
+                    captains=captains, solver_params=solver_params_st,
+                    hard_enemies=hard_enemies_st[0])
 
-        # UI Setup for Solve
         output_ct.controls.clear()
         output_ct.controls.append(ft.ProgressRing())
         output_ct.controls.append(ft.Text("Solving in Background...", italic=True))
-        tabs.selected_index = 9
+        
+        tabs.selected_index = 10
         page.update()
 
-        # The real-time callback hook for the UI
         def update_ui_with_temp_solution(partial_sol):
-            build_output_grid(partial_sol, people, tasks, hours, days, availability, emergency)
-            page.update()
+            if not ui_lock.acquire(blocking=False):
+                return
+            try:
+                build_output_grid(partial_sol, people, tasks, hours, days, availability, emergency)
+                page.update()
+            except Exception:
+                pass
+            finally:
+                ui_lock.release()
 
-        # The background task execution
         def run_solver():
             try:
-                final_sol = solve_model(data, ui_update_callback=update_ui_with_temp_solution) 
+                final_sol = solve_model(data, ui_update_callback=update_ui_with_temp_solution, active_model_ref=running_model_ref) 
                 build_output_grid(final_sol, people, tasks, hours, days, availability, emergency)
             except Exception as ex:
                 output_ct.controls.clear()
                 output_ct.controls.append(ft.Text(f"ERROR: {ex}", color=ft.Colors.RED_400, size=14))
             
-            # Remove ProgressRing
+            running_model_ref[0] = None
             if len(output_ct.controls) > 0 and isinstance(output_ct.controls[0], ft.ProgressRing):
                 output_ct.controls.pop(0)
             page.update()
 
-        # Start Gurobi in a background thread to prevent UI freezing
         threading.Thread(target=run_solver, daemon=True).start()
+
+    def do_stop(e):
+        if running_model_ref[0]:
+            output_ct.controls.insert(1, ft.Text("Interruption requested... Halting at current node.", color=ft.Colors.ORANGE_500, italic=True))
+            page.update()
+            running_model_ref[0].terminate()
 
     solve_btn = ft.Container(
         content=ft.Text("SOLVE", color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD),
         bgcolor=ft.Colors.BLUE_600, padding=10, border_radius=8, on_click=do_solve, width=200, alignment=ft.alignment.center
+    )
+    
+    stop_btn = ft.Container(
+        content=ft.Text("STOP", color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD),
+        bgcolor=ft.Colors.RED_600, padding=10, border_radius=8, on_click=do_stop, width=120, alignment=ft.alignment.center
     )
 
     tf_people.expand = False
@@ -872,10 +1060,11 @@ def main(page: ft.Page):
             ft.Tab(text="Min Quota",    content=ft.Container(quota_ct,padding=10, expand=True)),
             ft.Tab(text="Rotation",     content=ft.Container(rotation_ct,padding=10, expand=True)),
             ft.Tab(text="Weights",      content=ft.Container(weights_ct,padding=10, expand=True)),
+            ft.Tab(text="Parameters",   content=ft.Container(params_ct,padding=10, expand=True)), 
             ft.Tab(text="Output",       content=ft.Container(output_ct,padding=10, expand=True)),
         ])
 
-    page.add(ft.Row([solve_btn], alignment=ft.MainAxisAlignment.CENTER), tabs)
+    page.add(ft.Row([solve_btn, stop_btn], alignment=ft.MainAxisAlignment.CENTER), tabs)
     build_captains_list()
 
 ft.app(target=main)
