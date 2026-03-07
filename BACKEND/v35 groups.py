@@ -1,15 +1,11 @@
-
-
-
 import flet as ft
 import random
 import threading
 
-from solve_model_pace_10 import solve_model
-
+from solve_model_pace_13 import solve_model
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SCALE FACTOR
+# UI SCALING & CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 SCALE = 0.75
@@ -17,25 +13,24 @@ SCALE = 0.75
 def _s(v: float) -> int:
     return max(1, round(v * SCALE))
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_WEIGHTS = {
-    "W_COVERAGE": 300000, "W_FORCE": 100000, "W_CAPTAIN": 10000,
-    "W_STABILITY": 7000, "W_EQ_DAY": 5000, "W_GAP": 1000,
-    "W_EMERG": 750,      "W_EQ_GLOBAL": 500, "W_ROTATION": 100,
-    "W_SOCIAL": 50,      "W_QUOTA": 10,      "W_PREF": 1,
+    "W_COVERAGE": 1000000, "W_FORCE": 500000, "W_CAPTAIN": 100000,
+    "W_STABILITY": 50000,  "W_EQ_DAY": 10000, "W_GAP": 5000,
+    "W_EMERG": 1000,       "W_EQ_GLOBAL": 500, "W_EQ_GROUP": 200,
+    "W_EQ_VAR": 100,       "W_ROTATION": 50,   "W_SOCIAL": 10,
+    "W_QUOTA": 5,          "W_PREF": 1,
 }
 SORTED_VALUES = sorted(DEFAULT_WEIGHTS.values(), reverse=True)
 
 DEFAULT_SOLVER_PARAMS = {
-    "TimeLimit": 1200, "MIPGap": 0.01, "MIPFocus": 2,
+    "TimeLimit": 1200, "MIPGap": 0.001, "MIPFocus": 2,
     "Threads": 0, "Presolve": 2, "Symmetry": 2,
     "Disconnected": 2, "IntegralityFocus": 1, "Method": 3,
-    "Cuts": -1,
-    "Heuristics": 0.05,
+    "Cuts": -1, "Heuristics": 0.05,
 }
 
 DEFAULT_HOURS_TEXT = (
@@ -54,6 +49,12 @@ TASK_COLORS = [
     ("#FF8A65","#000000"), ("#AED581","#000000"), ("#4FC3F7","#000000"),
     ("#DCE775","#000000"), ("#BA68C8","#FFFFFF"), ("#4DD0E1","#000000"),
     ("#E57373","#000000"), ("#9575CD","#FFFFFF"), ("#FFD54F","#000000"),
+]
+
+# Group header palette (cycles if more groups than colors)
+GROUP_HEADER_COLORS = [
+    "#1565C0", "#2E7D32", "#6A1B9A", "#BF360C",
+    "#00695C", "#4527A0", "#AD1457", "#37474F",
 ]
 
 CAPTAIN_BG        = "#E65100"
@@ -76,9 +77,8 @@ BASE_ACTIVE_FG = "#FFFFFF"
 BASE_IDLE_BG   = "#A5D6A7"
 BASE_IDLE_FG   = "#000000"
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# APP STATE
+# APP STATE MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AppState:
@@ -90,8 +90,7 @@ class AppState:
         "Alexandre B\nRémi\nGabi\nJeanne B\nMatthieu A\nInès\nMaxime N\nAriane\nMatthias"
     )
     _DEFAULT_TASKS = (
-        "Pénélope\nAugustin B\nAgathe\nRafael\nLuna\nLéna\nCamille\nJuliette M\n"
-        "Paul\nManon P\nMatthieu G\nAlix\nNadim\nJean-Louis\nArthur"
+        "Iron\nRenew\nClean\nBackup\nDiscard\nSweep\nArchive\nCall\nLoad\nPolish\nReplace\nDefrost\nShake\nExercise\nPrepare\nInventory\nSew\nShine\nSort\nRecycle\nProgram\nWash\nRefuel\nBuy\nManage\nClean\nMeditate"
     )
     _DEFAULT_DAYS = "Mon\nTue\nWed"
 
@@ -110,6 +109,11 @@ class AppState:
         self.captains_st : dict = {}
         self.hard_enemies: bool = False
         self.hours_per_day: dict = {}
+
+        # ── Groups: {group_name: "member1\nmember2\n..."}  ──────────
+        # Each person must belong to exactly one group.
+        # If empty, the solver puts everyone in one implicit "Default" group.
+        self.groups_st: dict = {}   # e.g. {"Group A": "Alice\nBob", "Group B": "..."}
 
         self.consec_global_val   : str  = ""
         self.consec_personalized : bool = False
@@ -152,6 +156,34 @@ class AppState:
             parsed = _parse(raw)
             hours[j] = parsed if parsed else default_hrs
         return people, tasks, hours, days
+
+    def build_groups(self, people: list) -> dict:
+        """
+        Return {group_name: [list_of_people]} from groups_st.
+        People not assigned to any group go into an implicit 'Default' group.
+        If groups_st is empty, everyone goes into 'Default'.
+        """
+        def _parse(txt):
+            return [x.strip() for x in txt.split("\n") if x.strip()]
+
+        people_set = set(people)
+        assigned   = set()
+        result     = {}
+
+        for gname, members_text in self.groups_st.items():
+            members = [m for m in _parse(members_text) if m in people_set]
+            if members:
+                result[gname] = members
+                assigned.update(members)
+
+        unassigned = [p for p in people if p not in assigned]
+        if unassigned:
+            result["Default"] = unassigned
+
+        if not result:
+            result = {"Default": list(people)}
+
+        return result
 
     def _dims_hash(self) -> int:
         return hash((
@@ -197,7 +229,6 @@ class AppState:
                             continue
                         X_prev[(p, t, h, j)] = 1 if assigned_task == t else 0
         return X_prev
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UI HELPERS
@@ -269,11 +300,8 @@ class UIHelpers:
              for lbl in labels],
             spacing=2, wrap=False)
 
-    # ── Generic row/col toggle button ─────────────────────────────────────
-
     @staticmethod
     def make_rc_btn(label: str = "·") -> ft.Container:
-        """Bare blue-grey button shell; caller sets on_click."""
         return ft.Container(
             ft.Text(label, color=ft.Colors.WHITE, size=_s(10),
                     text_align=ft.TextAlign.CENTER),
@@ -283,7 +311,6 @@ class UIHelpers:
 
     @staticmethod
     def make_inc_btn(delta: int) -> ft.Container:
-        """Green (+1) or red (-1) increment button shell; caller sets on_click."""
         label = "+1" if delta > 0 else "-1"
         color = ft.Colors.GREEN_700 if delta > 0 else ft.Colors.RED_700
         return ft.Container(
@@ -298,8 +325,7 @@ class UIHelpers:
         dd = ft.Dropdown(
             label=label, value=value,
             options=[ft.dropdown.Option(o, text_style=ft.TextStyle(size=_s(11))) for o in options],
-            width=_s(width),
-            text_size=_s(11),
+            width=_s(width), text_size=_s(11),
             label_style=ft.TextStyle(size=_s(11)),
             dense=True,
             content_padding=ft.padding.symmetric(horizontal=_s(8), vertical=_s(4)))
@@ -385,14 +411,18 @@ class UIHelpers:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BASE TAB
+# BASE TAB TEMPLATE
 # ══════════════════════════════════════════════════════════════════════════════
 
 class BaseTab:
     def __init__(self, state: AppState, page: ft.Page):
         self.state = state
         self.page  = page
-        self._ct   = ft.Column(expand=True, spacing=_s(5), scroll=ft.ScrollMode.ALWAYS)
+        self._ct   = ft.ListView(spacing=_s(5))
+
+    def set_matrix_columns(self, num_columns: int):
+        total_width = UIHelpers.W_LBL + UIHelpers.W_CELL + _s(4) + (num_columns * (UIHelpers.W_CELL + 2)) + _s(40)
+        self._ct.width = total_width
 
     def build(self):
         raise NotImplementedError
@@ -406,13 +436,11 @@ class BaseTab:
                 vertical_alignment=ft.CrossAxisAlignment.START),
             padding=_s(10), expand=True)
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# DIMENSIONS TAB
+# DIMENSIONS TAB  (with Groups column)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DimensionsTab:
-
     def __init__(self, state: AppState, page: ft.Page, on_solve_blocked_update):
         self.state = state
         self.page  = page
@@ -443,7 +471,7 @@ class DimensionsTab:
             on_change=self._on_people_change)
         self.tf_tasks = ft.TextField(
             value=s.tasks_text, multiline=True, min_lines=8, max_lines=200,
-            label="Tasks (one per line)", width=_s(180), text_size=_s(11),
+            label="Tasks (one per line)", width=_s(280), text_size=_s(11),
             label_style=ft.TextStyle(size=_s(11)),
             on_change=self._on_tasks_change)
         self.tf_days = ft.TextField(
@@ -493,12 +521,17 @@ class DimensionsTab:
                    spacing=_s(8), vertical_alignment=ft.CrossAxisAlignment.START),
         ], spacing=_s(10))
 
-        self._right_col = ft.Column(
-            [enforced_rest_col, ft.Divider(), params_section], width=_s(250))
+        self._right_col = ft.ListView(
+            controls=[enforced_rest_col, ft.Divider(), params_section], width=_s(250))
 
         self._captains_col = ft.ListView(width=_s(230), spacing=_s(4))
         self._rotation_col = ft.ListView(width=_s(150), spacing=_s(4))
         self._hours_col    = ft.ListView(width=_s(150), spacing=_s(4))
+
+        # ── Groups column ─────────────────────────────────────────────
+        self._groups_col = ft.ListView(width=_s(260), spacing=_s(4))
+
+    # ── onChange handlers ─────────────────────────────────────────────
 
     def _on_people_change(self, e):
         self.state.people_text = e.control.value
@@ -563,6 +596,122 @@ class DimensionsTab:
         for k, tf in self._param_tfs.items():
             tf.value = str(DEFAULT_SOLVER_PARAMS[k])
             tf.update()
+
+    # ── Groups column builder ─────────────────────────────────────────
+
+    def _build_groups_list(self):
+        s = self.state
+        buf = []
+
+        # Header row with "Add Group" button
+        def _add_group(e):
+            new_key = f"Group {len(s.groups_st) + 1}"
+            # ensure unique name
+            i = 1
+            while new_key in s.groups_st:
+                new_key = f"Group {i}"
+                i += 1
+            s.groups_st[new_key] = ""
+            self._build_groups_list()
+
+        buf.append(ft.Row([
+            ft.Text("Groups", weight=ft.FontWeight.BOLD, size=_s(13)),
+            ft.Container(
+                content=ft.Text("+ Add Group", color=ft.Colors.WHITE,
+                                size=_s(11), weight=ft.FontWeight.BOLD),
+                bgcolor=ft.Colors.TEAL_600, padding=ft.padding.symmetric(_s(4), _s(8)),
+                border_radius=4, on_click=_add_group),
+        ], spacing=_s(10), vertical_alignment=ft.CrossAxisAlignment.CENTER))
+
+        buf.append(ft.Text(
+            "One person per line. People not assigned\nto any group go to 'Default'.",
+            size=_s(10), italic=True, color=ft.Colors.GREY_600))
+
+        for idx, gname in enumerate(list(s.groups_st.keys())):
+            bg_color = GROUP_HEADER_COLORS[idx % len(GROUP_HEADER_COLORS)]
+
+            # Editable group name
+            tf_name = ft.TextField(
+                value=gname,
+                width=_s(140), height=_s(30), text_size=_s(11),
+                content_padding=ft.padding.symmetric(horizontal=_s(6), vertical=_s(2)),
+                color=ft.Colors.WHITE,
+                bgcolor=bg_color,
+                border_color=ft.Colors.WHITE,
+                cursor_color=ft.Colors.WHITE,
+            )
+            def _rename(e, _old=gname):
+                new_name = e.control.value.strip()
+                if not new_name or new_name == _old:
+                    return
+                if new_name in s.groups_st:
+                    e.control.border_color = ft.Colors.RED_400
+                    e.control.update()
+                    return
+                # Re-insert with new key preserving order
+                new_dict = {}
+                for k, v in s.groups_st.items():
+                    new_dict[new_name if k == _old else k] = v
+                s.groups_st.clear()
+                s.groups_st.update(new_dict)
+                e.control.border_color = ft.Colors.WHITE
+                e.control.update()
+            tf_name.on_blur = _rename
+
+            # Delete button
+            def _delete(e, _k=gname):
+                s.groups_st.pop(_k, None)
+                self._build_groups_list()
+
+            del_btn = ft.IconButton(
+                icon=ft.Icons.DELETE_OUTLINE,
+                icon_color=ft.Colors.WHITE,
+                icon_size=_s(16),
+                tooltip="Remove group",
+                style=ft.ButtonStyle(padding=ft.padding.all(_s(2))),
+                on_click=_delete)
+
+            header_row = ft.Container(
+                content=ft.Row([tf_name, del_btn], spacing=_s(4),
+                               vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                bgcolor=bg_color,
+                padding=ft.padding.symmetric(horizontal=_s(6), vertical=_s(4)),
+                border_radius=ft.border_radius.only(top_left=4, top_right=4))
+
+            # Members text area
+            tf_members = ft.TextField(
+                value=s.groups_st[gname],
+                multiline=True, min_lines=3, max_lines=12,
+                width=_s(240), text_size=_s(11),
+                hint_text="One member per line…",
+                content_padding=ft.padding.all(_s(4)),
+                border_color=bg_color,
+                border_width=2,
+            )
+            def _ch_members(e, _k=gname):
+                s.groups_st[_k] = e.control.value
+            tf_members.on_change = _ch_members
+
+            buf.append(ft.Column([
+                header_row,
+                ft.Container(
+                    content=tf_members,
+                    border=ft.border.only(
+                        left=ft.border.BorderSide(2, bg_color),
+                        right=ft.border.BorderSide(2, bg_color),
+                        bottom=ft.border.BorderSide(2, bg_color)),
+                    border_radius=ft.border_radius.only(bottom_left=4, bottom_right=4)),
+            ], spacing=0))
+
+        if not s.groups_st:
+            buf.append(ft.Text(
+                "No groups defined.\nEveryone will be in one 'Default' group.",
+                size=_s(11), italic=True, color=ft.Colors.GREY_500))
+
+        self._groups_col.controls = buf
+        self.page.update()
+
+    # ── Other column builders ─────────────────────────────────────────
 
     def _build_captains_list(self):
         s = self.state
@@ -665,6 +814,7 @@ class DimensionsTab:
         self._build_captains_list()
         self._build_rotation_list()
         self._build_hours_per_day()
+        self._build_groups_list()
 
     def get_container(self) -> ft.Container:
         return ft.Container(
@@ -673,18 +823,17 @@ class DimensionsTab:
                     self._right_col, self.tf_people, self._captains_col,
                     self.tf_tasks,   self._rotation_col,
                     self.tf_days,    self._hours_col,
+                    ft.VerticalDivider(width=1, color="#455A64"),
+                    self._groups_col,           # ← new groups column
                 ],
                 spacing=_s(20),
                 alignment=ft.MainAxisAlignment.START,
                 vertical_alignment=ft.CrossAxisAlignment.START,
-                scroll=ft.ScrollMode.ADAPTIVE),
+                scroll=ft.ScrollMode.ALWAYS),
             padding=_s(20), expand=True)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AVAILABILITY TAB
-# Row buttons already existed; col buttons added.
-# Both use cell_map for in-place updates (no full rebuild).
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AvailabilityTab(BaseTab):
@@ -734,7 +883,6 @@ class AvailabilityTab(BaseTab):
 
         buf.append(ft.Text(f"-- {j} --", weight=ft.FontWeight.BOLD, size=_s(14)))
 
-        # ── Hour-label header row ──────────────────────────────────────────
         buf.append(ft.Row(
             [ft.Container(width=UIHelpers.W_LBL + UIHelpers.W_CELL + 4)] +
             [ft.Container(ft.Text(h, size=_s(9), no_wrap=True, overflow=ft.TextOverflow.CLIP),
@@ -742,7 +890,6 @@ class AvailabilityTab(BaseTab):
              for h in day_hrs],
             spacing=2, wrap=False))
 
-        # ── Col-toggle buttons row ─────────────────────────────────────────
         def _make_col_toggle(_h):
             btn = UIHelpers.make_rc_btn("col")
             def _click(e, __h=_h):
@@ -763,7 +910,6 @@ class AvailabilityTab(BaseTab):
             [_make_col_toggle(h) for h in day_hrs],
             spacing=2, wrap=False))
 
-        # ── Person rows with row-toggle buttons ────────────────────────────
         for p in people:
             def _row_toggle(_p=p, _j=j):
                 btn = UIHelpers.make_rc_btn("row")
@@ -791,12 +937,12 @@ class AvailabilityTab(BaseTab):
                 spacing=2, wrap=False))
 
         buf.append(ft.Divider())
+        self.set_matrix_columns(len(day_hrs))
         self._ct.controls = buf
         self.page.update()
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# DEMAND TAB  (unchanged from original)
+# DEMAND TAB
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DemandTab(BaseTab):
@@ -861,7 +1007,6 @@ class DemandTab(BaseTab):
 
         buf += [ft.Text(f"-- {j} --", weight=ft.FontWeight.BOLD, size=_s(14)), err_txt]
 
-        # ── helpers ────────────────────────────────────────────────────────
         _spacer = ft.Container(width=UIHelpers.W_LBL + UIHelpers.W_CELL + 2)
 
         def _adj(k, delta):
@@ -892,9 +1037,7 @@ class DemandTab(BaseTab):
             btn.on_click = _click
             return btn
 
-        # top +1 col buttons
         buf.append(ft.Row([_spacer] + [_col_btn(h, +1) for h in day_hrs], spacing=2, wrap=False))
-        # hour header labels
         buf.append(ft.Row(
             [_spacer] +
             [ft.Container(ft.Text(h, size=_s(9), no_wrap=True, overflow=ft.TextOverflow.CLIP),
@@ -902,9 +1045,9 @@ class DemandTab(BaseTab):
              for h in day_hrs],
             spacing=2, wrap=False))
 
-        for t in tasks:
+        for idx_t, t in enumerate(tasks):
             cells = []
-            for h in day_hrs:
+            for idx_h, h in enumerate(day_hrs):
                 k = (t, h, j)
                 s.demand_st.setdefault(k, "1")
                 is_ok = UIHelpers.validate_nonneg_int(s.demand_st[k])
@@ -912,7 +1055,32 @@ class DemandTab(BaseTab):
                     value=s.demand_st[k], width=UIHelpers.W_CELL, height=UIHelpers.H_TF,
                     text_size=_s(11), data=k, content_padding=ft.padding.all(_s(2)),
                     border_color=ft.Colors.RED_400 if not is_ok else None)
-                def _ch(e, _k=k, _err=err_txt):
+
+                def _ch(e, _k=k, _t_idx=idx_t, _h_idx=idx_h, _err=err_txt):
+                    pasted_text = e.control.value
+                    if "\t" in pasted_text or "\n" in pasted_text:
+                        rows = pasted_text.strip().split("\n")
+                        for r_offset, row_str in enumerate(rows):
+                            target_t_idx = _t_idx + r_offset
+                            if target_t_idx >= len(tasks):
+                                break
+                            target_t = tasks[target_t_idx]
+                            cols = row_str.split("\t")
+                            for c_offset, val_str in enumerate(cols):
+                                target_h_idx = _h_idx + c_offset
+                                if target_h_idx >= len(day_hrs):
+                                    break
+                                target_h  = day_hrs[target_h_idx]
+                                clean_val = val_str.strip()
+                                target_key = (target_t, target_h, j)
+                                s.demand_st[target_key] = clean_val
+                                if UIHelpers.validate_nonneg_int(clean_val):
+                                    s.validation_errors["demand"].discard(target_key)
+                                else:
+                                    s.validation_errors["demand"].add(target_key)
+                        self._on_solve_blocked_update()
+                        self.build()
+                        return
                     s.demand_st[_k] = e.control.value
                     if UIHelpers.validate_nonneg_int(e.control.value):
                         s.validation_errors["demand"].discard(_k)
@@ -926,22 +1094,22 @@ class DemandTab(BaseTab):
                     self._on_solve_blocked_update()
                     e.control.update()
                     _err.update()
+
                 tf.on_change = _ch
                 cells.append(tf)
+
             buf.append(ft.Row(
                 [UIHelpers.lbl(t), _row_btn(t, +1)] + cells + [_row_btn(t, -1)],
                 spacing=2, wrap=False))
 
-        # bottom -1 col buttons
         buf.append(ft.Row([_spacer] + [_col_btn(h, -1) for h in day_hrs], spacing=2, wrap=False))
-
         buf.append(ft.Divider())
+        self.set_matrix_columns(len(day_hrs))
         self._ct.controls = buf
         self.page.update()
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# SKILLS TAB  — row & col toggles added
+# SKILLS TAB
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SkillsTab(BaseTab):
@@ -964,7 +1132,6 @@ class SkillsTab(BaseTab):
             s.invalidate_cache()
             self.build()
 
-        # ── Col toggle: flip all people for one task ───────────────────────
         def _make_col_toggle(_t):
             btn = UIHelpers.make_rc_btn("col")
             def _click(e, __t=_t):
@@ -977,7 +1144,6 @@ class SkillsTab(BaseTab):
             btn.on_click = _click
             return btn
 
-        # ── Row toggle: flip all tasks for one person ──────────────────────
         def _make_row_toggle(_p):
             btn = UIHelpers.make_rc_btn("row")
             def _click(e, __p=_p):
@@ -999,16 +1165,14 @@ class SkillsTab(BaseTab):
                              bgcolor=ft.Colors.PURPLE_400, padding=_s(8), border_radius=4,
                              on_click=_rand, width=_s(150), alignment=ft.alignment.center),
             ], spacing=_s(10)),
-            # header labels row
             ft.Row(
                 [ft.Container(width=UIHelpers.W_LBL),
-                 ft.Container(width=UIHelpers.W_CELL)] +   # spacer above row-btn col
+                 ft.Container(width=UIHelpers.W_CELL)] +
                 [ft.Container(
                     ft.Text(t, size=_s(9), no_wrap=True, overflow=ft.TextOverflow.CLIP),
                     width=UIHelpers.W_CELL, clip_behavior=ft.ClipBehavior.HARD_EDGE)
                  for t in tasks],
                 spacing=2, wrap=False),
-            # col-toggle row
             ft.Row(
                 [ft.Container(width=UIHelpers.W_LBL),
                  ft.Container(width=UIHelpers.W_CELL)] +
@@ -1022,13 +1186,12 @@ class SkillsTab(BaseTab):
                  _make_row_toggle(p)] +
                 [UIHelpers.make_toggle(s.skills_st, (p, t), 1) for t in tasks],
                 spacing=2))
-
+        self.set_matrix_columns(len(tasks))
         self._ct.controls = buf
         self.page.update()
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# QUOTA TAB  (unchanged)
+# QUOTA TAB
 # ══════════════════════════════════════════════════════════════════════════════
 
 class QuotaTab(BaseTab):
@@ -1095,7 +1258,6 @@ class QuotaTab(BaseTab):
             ft.Text(f"-- {j} --", weight=ft.FontWeight.BOLD, size=_s(14)),
         ]
 
-        # ── helpers ────────────────────────────────────────────────────────
         _spacer = ft.Container(width=UIHelpers.W_LBL + UIHelpers.W_CELL + 2)
 
         def _adj(k, delta):
@@ -1126,9 +1288,7 @@ class QuotaTab(BaseTab):
             btn.on_click = _click
             return btn
 
-        # top +1 col buttons
         buf.append(ft.Row([_spacer] + [_col_btn(t, +1) for t in tasks], spacing=2, wrap=False))
-        # task header labels
         buf.append(ft.Row(
             [_spacer] +
             [ft.Container(ft.Text(t, size=_s(9), no_wrap=True, overflow=ft.TextOverflow.CLIP),
@@ -1166,16 +1326,14 @@ class QuotaTab(BaseTab):
                 [UIHelpers.plbl(p, s.captains_st), _row_btn(p, +1)] + cells + [_row_btn(p, -1)],
                 spacing=2, wrap=False))
 
-        # bottom -1 col buttons
         buf.append(ft.Row([_spacer] + [_col_btn(t, -1) for t in tasks], spacing=2, wrap=False))
-
         buf.append(ft.Divider())
+        self.set_matrix_columns(len(tasks))
         self._ct.controls = buf
         self.page.update()
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# FORCE TAB  — row & col toggles added
+# FORCE TAB
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ForceTab(BaseTab):
@@ -1214,7 +1372,6 @@ class ForceTab(BaseTab):
         ti      = tasks.index(t) if t in tasks else 0
         tbg, tfg = TASK_COLORS[ti % len(TASK_COLORS)]
 
-        # ── Col toggle: flip all people for one hour ───────────────────────
         def _make_col_toggle(_h):
             btn = UIHelpers.make_rc_btn("col")
             def _click(e, __h=_h):
@@ -1226,7 +1383,6 @@ class ForceTab(BaseTab):
             btn.on_click = _click
             return btn
 
-        # ── Row toggle: flip all hours for one person ──────────────────────
         def _make_row_toggle(_p):
             btn = UIHelpers.make_rc_btn("row")
             def _click(e, __p=_p):
@@ -1247,7 +1403,6 @@ class ForceTab(BaseTab):
 
         buf.append(ft.Text(f"-- {t} / {j} --", weight=ft.FontWeight.BOLD, size=_s(14)))
 
-        # header labels
         buf.append(ft.Row(
             [ft.Container(width=UIHelpers.W_LBL),
              ft.Container(width=UIHelpers.W_CELL)] +
@@ -1257,7 +1412,6 @@ class ForceTab(BaseTab):
              for h in day_hrs],
             spacing=2, wrap=False))
 
-        # col toggles
         buf.append(ft.Row(
             [ft.Container(width=UIHelpers.W_LBL),
              ft.Container(width=UIHelpers.W_CELL)] +
@@ -1273,12 +1427,12 @@ class ForceTab(BaseTab):
                 spacing=2, wrap=False))
 
         buf.append(ft.Divider())
+        self.set_matrix_columns(len(day_hrs))
         self._ct.controls = buf
         self.page.update()
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# SOCIAL TAB  — row & col toggles added
+# SOCIAL TAB
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SocialTab(BaseTab):
@@ -1324,9 +1478,8 @@ class SocialTab(BaseTab):
         _clr  = {0: ft.Colors.GREY_400, 1: ft.Colors.GREEN_700, -1: ft.Colors.RED_700}
         _next = {0: 1, 1: -1, -1: 0}
 
-        col_people = people[1:]   # columns shown in header
+        col_people = people[1:]
 
-        # ── Col toggle: flip all (p1, p2) pairs where p1 comes before p2 ──
         def _make_col_toggle(_p2):
             p2_idx = people.index(_p2)
             btn = UIHelpers.make_rc_btn("col")
@@ -1343,7 +1496,6 @@ class SocialTab(BaseTab):
             btn.on_click = _click
             return btn
 
-        # ── Row toggle: flip all (p1, p2) pairs where p2 comes after p1 ───
         def _make_row_toggle(_p1):
             p1_idx = people.index(_p1)
             btn = UIHelpers.make_rc_btn("row")
@@ -1360,7 +1512,6 @@ class SocialTab(BaseTab):
             btn.on_click = _click
             return btn
 
-        # header labels row  [spacer_name | spacer_rowbtn | label_p2 ...]
         buf.append(ft.Row(
             [ft.Container(width=UIHelpers.W_LBL),
              ft.Container(width=UIHelpers.W_CELL)] +
@@ -1370,14 +1521,12 @@ class SocialTab(BaseTab):
              for p in col_people],
             spacing=2, wrap=False))
 
-        # col-toggle row  [spacer_name | spacer_rowbtn | col_btn_p2 ...]
         buf.append(ft.Row(
             [ft.Container(width=UIHelpers.W_LBL),
              ft.Container(width=UIHelpers.W_CELL)] +
             [_make_col_toggle(p2) for p2 in col_people],
             spacing=2, wrap=False))
 
-        # person rows
         for i, p1 in enumerate(people):
             cells = []
             for p2 in col_people:
@@ -1407,9 +1556,9 @@ class SocialTab(BaseTab):
                      _make_row_toggle(p1)] + cells,
                     spacing=2, wrap=False))
 
+        self.set_matrix_columns(len(col_people))
         self._ct.controls = buf
         self.page.update()
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # WEIGHTS TAB
@@ -1420,7 +1569,7 @@ class WeightsTab:
     def __init__(self, state: AppState, page: ft.Page):
         self.state = state
         self.page  = page
-        self._ct   = ft.Column(expand=True, spacing=_s(5), scroll=ft.ScrollMode.ALWAYS)
+        self._ct   = ft.ListView(expand=True, spacing=_s(5))
 
     def build(self):
         s = self.state
@@ -1462,8 +1611,7 @@ class WeightsTab:
             sw.on_change = _toggle
             items.append(ft.Container(
                 content=ft.Row([
-                    ft.Text(f"#{i + 1}", width=_s(30), weight=ft.FontWeight.BOLD,
-                            size=_s(12)),
+                    ft.Text(f"#{i + 1}", width=_s(30), weight=ft.FontWeight.BOLD, size=_s(12)),
                     ft.Text(key, expand=True, weight=ft.FontWeight.W_800, size=_s(12)),
                     ft.Text(f"{val}",
                             color=ft.Colors.BLACK if s.weights_enabled[key] else ft.Colors.GREY_500,
@@ -1491,7 +1639,6 @@ class WeightsTab:
     def get_container(self) -> ft.Container:
         return ft.Container(self._ct, padding=_s(10), expand=True)
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # OUTPUT TAB
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1501,7 +1648,7 @@ class OutputTab:
     def __init__(self, state: AppState, page: ft.Page):
         self.state = state
         self.page  = page
-        self._ct   = ft.Column(expand=True, spacing=_s(5), scroll=ft.ScrollMode.ALWAYS)
+        self._ct   = ft.ListView(expand=True, spacing=_s(5), horizontal=True)
 
     def _handle_base_click(self, run_idx: int):
         s = self.state
@@ -1539,8 +1686,182 @@ class OutputTab:
             width=_s(13), height=_s(13), bgcolor=color, border_radius=7,
             alignment=ft.alignment.center, right=1, top=1)
 
+    # ── Workload equity section (grouped) ────────────────────────────
+
+    @staticmethod
+    def _build_workload_section(
+        sol: dict, people: list, groups: dict,
+        diff_mode: str, ref_sol: dict | None
+    ) -> list:
+        """
+        Returns a list of Flet controls for the WORKLOAD EQUITY section.
+        Displays per-person hours grouped by group, with intra-group and
+        inter-group spread statistics.
+        """
+        buf = []
+        buf.append(ft.Text("WORKLOAD EQUITY", weight=ft.FontWeight.BOLD, size=_s(14)))
+
+        workload     = sol.get("workload", {})
+        ref_workload = ref_sol.get("workload", {}) if ref_sol else {}
+        group_wl     = sol.get("group_workload", {})   # from solve_model
+
+        # Fall back: if no group info (old run or live), show flat list
+        if not groups or not group_wl:
+            for p in people:
+                ch = workload.get(p, 0)
+                if diff_mode == "cmp" and ref_sol is not None:
+                    ph = ref_workload.get(p, 0)
+                    color = ft.Colors.ORANGE_700 if ch != ph else None
+                    weight = ft.FontWeight.BOLD if ch != ph else None
+                    suffix = f"  ({ph:.0f} prev)" if ch != ph else ""
+                    buf.append(ft.Text(f"  {p}: {ch:.0f}h{suffix}", size=_s(12),
+                                       color=color, weight=weight))
+                else:
+                    buf.append(ft.Text(f"  {p}: {ch:.0f}h", size=_s(12)))
+            wl_vals = [workload.get(p, 0) for p in people]
+            if wl_vals:
+                buf.append(ft.Text(
+                    f"  Global: max={max(wl_vals):.0f}h  min={min(wl_vals):.0f}h  "
+                    f"spread={max(wl_vals) - min(wl_vals):.0f}h",
+                    size=_s(12), italic=True, color=ft.Colors.GREY_700))
+            return buf
+
+        # ── Grouped display ──────────────────────────────────────────
+        group_totals = []   # for inter-group spread at the end
+
+        for g_idx, (gname, members) in enumerate(groups.items()):
+            bg = GROUP_HEADER_COLORS[g_idx % len(GROUP_HEADER_COLORS)]
+            ginfo = group_wl.get(gname, {})
+            total_h  = ginfo.get("total_hours",      sum(workload.get(p, 0) for p in members))
+            target_h = ginfo.get("target_hours",     0.0)
+            dev      = ginfo.get("deviation",        total_h - target_h)
+            pp_avg   = ginfo.get("per_person_avg",   total_h / max(len(members), 1))
+            pp_tgt   = ginfo.get("per_person_target", target_h / max(len(members), 1))
+
+            group_totals.append((gname, total_h))
+
+            # Per-person hours within group (to compute intra-group spread)
+            member_hours = [workload.get(p, 0) for p in members if p in workload]
+            intra_max    = max(member_hours) if member_hours else 0
+            intra_min    = min(member_hours) if member_hours else 0
+            intra_spread = intra_max - intra_min
+
+            dev_str  = f"{dev:+.1f}h" if dev != 0 else "±0h"
+            dev_clr  = "#C62828" if dev < -0.5 else ("#2E7D32" if dev > 0.5 else "#546E7A")
+
+            # Group header bar
+            buf.append(ft.Container(
+                content=ft.Row([
+                    ft.Text(f"▶  {gname}", color=ft.Colors.WHITE,
+                            weight=ft.FontWeight.BOLD, size=_s(13), expand=True),
+                    ft.Text(f"{total_h:.0f}h total", color=ft.Colors.WHITE,
+                            size=_s(12), weight=ft.FontWeight.BOLD),
+                ], spacing=_s(8)),
+                bgcolor=bg,
+                padding=ft.padding.symmetric(horizontal=_s(10), vertical=_s(6)),
+                border_radius=ft.border_radius.only(top_left=6, top_right=6),
+                margin=ft.margin.only(top=_s(6))))
+
+            # Stats sub-bar
+            buf.append(ft.Container(
+                content=ft.Row([
+                    ft.Text(f"Target: {target_h:.1f}h", size=_s(11),
+                            color=ft.Colors.GREY_800),
+                    ft.Container(width=1, height=_s(12),
+                                 bgcolor=ft.Colors.GREY_400),
+                    ft.Text(f"Dev: {dev_str}", size=_s(11),
+                            color=dev_clr, weight=ft.FontWeight.BOLD),
+                    ft.Container(width=1, height=_s(12),
+                                 bgcolor=ft.Colors.GREY_400),
+                    ft.Text(f"Avg/person: {pp_avg:.1f}h  (tgt {pp_tgt:.1f}h)",
+                            size=_s(11), color=ft.Colors.GREY_700),
+                    ft.Container(width=1, height=_s(12),
+                                 bgcolor=ft.Colors.GREY_400),
+                    ft.Text(f"Intra-spread: {intra_spread:.0f}h  "
+                            f"(↑{intra_max:.0f}h  ↓{intra_min:.0f}h)",
+                            size=_s(11), color=ft.Colors.GREY_700),
+                ], spacing=_s(10), wrap=True),
+                bgcolor="#ECEFF1",
+                padding=ft.padding.symmetric(horizontal=_s(10), vertical=_s(4)),
+                border=ft.border.only(
+                    left=ft.border.BorderSide(3, bg),
+                    right=ft.border.BorderSide(1, "#CFD8DC"))))
+
+            # Per-person rows
+            for p in members:
+                ch = workload.get(p, 0)
+                # Simple bar: filled blocks proportional to hours
+                bar_max  = max(intra_max, 1)
+                bar_fill = round((ch / bar_max) * 20)  # max 20 chars wide
+                bar_str  = "█" * bar_fill + "░" * (20 - bar_fill)
+
+                if diff_mode == "cmp" and ref_sol is not None:
+                    ph = ref_workload.get(p, 0)
+                    changed = (ch != ph)
+                    suffix  = f"  ← was {ph:.0f}h" if changed else ""
+                    clr     = ft.Colors.ORANGE_700 if changed else ft.Colors.BLACK
+                    wgt     = ft.FontWeight.BOLD if changed else None
+                else:
+                    suffix = ""
+                    clr    = ft.Colors.BLACK
+                    wgt    = None
+
+                buf.append(ft.Container(
+                    content=ft.Row([
+                        ft.Text(p, size=_s(12), width=_s(110), color=clr, weight=wgt,
+                                no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
+                        ft.Text(f"{ch:.0f}h", size=_s(12), width=_s(32),
+                                color=clr, weight=wgt,
+                                text_align=ft.TextAlign.RIGHT),
+                        ft.Text(bar_str, size=_s(9), color=bg,
+                                font_family="monospace"),
+                        ft.Text(suffix, size=_s(11), color=ft.Colors.ORANGE_700,
+                                italic=True),
+                    ], spacing=_s(6)),
+                    padding=ft.padding.symmetric(horizontal=_s(14), vertical=_s(2)),
+                    bgcolor=ft.Colors.WHITE,
+                    border=ft.border.only(
+                        left=ft.border.BorderSide(3, bg),
+                        bottom=ft.border.BorderSide(1, "#ECEFF1"))))
+
+        # ── Inter-group spread ────────────────────────────────────────
+        if group_totals:
+            g_max_name, g_max_val = max(group_totals, key=lambda x: x[1])
+            g_min_name, g_min_val = min(group_totals, key=lambda x: x[1])
+            inter_spread = g_max_val - g_min_val
+            all_wl = [workload.get(p, 0) for p in people]
+
+            buf.append(ft.Container(
+                content=ft.Column([
+                    ft.Text("◎  Inter-group summary", weight=ft.FontWeight.BOLD,
+                            size=_s(12), color=ft.Colors.WHITE),
+                    ft.Row([
+                        ft.Text(f"Inter-group spread: {inter_spread:.0f}h",
+                                size=_s(12), color=ft.Colors.WHITE,
+                                weight=ft.FontWeight.BOLD),
+                        ft.Text(f"(max: {g_max_name} {g_max_val:.0f}h  ·  "
+                                f"min: {g_min_name} {g_min_val:.0f}h)",
+                                size=_s(11), color="#B0BEC5"),
+                    ], spacing=_s(10), wrap=True),
+                    ft.Text(
+                        f"Global individual: max={max(all_wl):.0f}h  "
+                        f"min={min(all_wl):.0f}h  "
+                        f"spread={max(all_wl) - min(all_wl):.0f}h"
+                        if all_wl else "",
+                        size=_s(11), color="#B0BEC5"),
+                ], spacing=_s(4)),
+                bgcolor="#37474F",
+                padding=ft.padding.symmetric(horizontal=_s(12), vertical=_s(8)),
+                border_radius=6,
+                margin=ft.margin.only(top=_s(8))))
+
+        return buf
+
+    # ── Run column builder ────────────────────────────────────────────
+
     def _build_run_column(self, run_idx, sol, people, tasks, hours, days,
-                          availability, emergency, is_live=False, on_delete=None):
+                          availability, emergency, groups=None,
+                          is_live=False, on_delete=None):
         s          = self.state
         status     = sol.get("status", "Solving...")
         is_solving = "Solving" in status
@@ -1563,17 +1884,17 @@ class OutputTab:
         buf      = []
 
         if is_live:
-            d_lbl, d_bg, d_fg, d_click = "Comparar", ft.Colors.GREY_400, ft.Colors.GREY_600, None
+            d_lbl, d_bg, d_fg, d_click = "Compare", ft.Colors.GREY_400, ft.Colors.GREY_600, None
         elif diff_mode == "ref":
-            d_lbl, d_bg, d_fg = "Referencia", ft.Colors.LIGHT_BLUE_300, ft.Colors.BLACK
+            d_lbl, d_bg, d_fg = "Reference", ft.Colors.LIGHT_BLUE_300, ft.Colors.BLACK
             d_click = lambda e, _i=run_idx: self._handle_diff_click(_i)
         elif diff_mode == "cmp":
-            d_lbl, d_bg, d_fg = "Comparado", ft.Colors.AMBER_300, ft.Colors.BLACK
+            d_lbl, d_bg, d_fg = "Compared", ft.Colors.AMBER_300, ft.Colors.BLACK
             d_click = lambda e, _i=run_idx: self._handle_diff_click(_i)
         elif both_sel:
-            d_lbl, d_bg, d_fg, d_click = "Comparar", ft.Colors.GREY_400, ft.Colors.GREY_600, None
+            d_lbl, d_bg, d_fg, d_click = "Compare", ft.Colors.GREY_400, ft.Colors.GREY_600, None
         else:
-            d_lbl, d_bg, d_fg = "Comparar", ft.Colors.GREEN_200, ft.Colors.BLACK
+            d_lbl, d_bg, d_fg = "Compare", ft.Colors.GREEN_200, ft.Colors.BLACK
             d_click = lambda e, _i=run_idx: self._handle_diff_click(_i)
 
         diff_btn = ft.Container(
@@ -1605,7 +1926,7 @@ class OutputTab:
 
         if not is_live:
             is_base    = (run_idx == s.base_run_idx)
-            base_label = "✓ Base activo" if is_base else "📌 Usar como Base"
+            base_label = "✓ Active Base" if is_base else "📌 Set as Base"
             base_btn   = ft.Container(
                 content=ft.Text(base_label, size=_s(11),
                                 color=BASE_ACTIVE_FG if is_base else BASE_IDLE_FG,
@@ -1614,9 +1935,9 @@ class OutputTab:
                 padding=ft.padding.symmetric(_s(4), _s(8)),
                 border_radius=4,
                 tooltip=(
-                    "Base activo. Pulsa de nuevo para desactivarlo."
+                    "Active Base. Click again to deactivate."
                     if is_base else
-                    "Marcar como Base: el próximo Solve minimizará cambios respecto a este planning."
+                    "Set as Base: the next Solve will minimize changes from this schedule."
                 ),
                 on_click=lambda e, _i=run_idx: self._handle_base_click(_i))
             action_row = ft.Row(controls=[base_btn, diff_btn],
@@ -1735,9 +2056,9 @@ class OutputTab:
                         padding=ft.padding.symmetric(_s(4), _s(8)), border_radius=4))
                 if diff_mode == "cmp":
                     for char, color, desc in [
-                        ("+", DIFF_ADD_COLOR,    "Nueva asignación"),
-                        ("−", DIFF_REMOVE_COLOR, "Eliminada"),
-                        ("⇄", DIFF_CHANGE_COLOR, "Cambiada"),
+                        ("+", DIFF_ADD_COLOR,    "New assignment"),
+                        ("−", DIFF_REMOVE_COLOR, "Removed"),
+                        ("⇄", DIFF_CHANGE_COLOR, "Changed"),
                     ]:
                         legend.append(ft.Row([
                             ft.Container(
@@ -1751,6 +2072,7 @@ class OutputTab:
                 buf.append(ft.Divider())
 
             if not (is_live and is_solving):
+                # ── Report sections ───────────────────────────────────
                 for section_title, issues, empty_msg in [
                     ("MISSING STAFF",
                      sol.get("missing", []),         "None -- all demand covered!"),
@@ -1761,7 +2083,7 @@ class OutputTab:
                     ("SOCIAL",
                      sol.get("social_issues", []),    "None -- all respected!"),
                     ("CAPTAIN PRESENCE",
-                     sol.get("captain_issues", []),   "No captains designated or all hours covered."),
+                     sol.get("captain_issues", []),   "No captains designated."),
                     ("EMERGENCY CALL-INS",
                      sol.get("emerg_issues", []),     "None -- no emergency hours used!"),
                     ("QUOTA FULFILMENT",
@@ -1772,45 +2094,54 @@ class OutputTab:
                     if section_title == "SHIFT SEGMENTS / FRAGMENTATION" and sol.get("enforced_rest", False):
                         continue
                     buf.append(ft.Text(section_title, weight=ft.FontWeight.BOLD, size=_s(14)))
-                    if issues:
-                        for line in issues:
-                            buf.append(ft.Text(f"  {line}", size=_s(12)))
-                    else:
-                        buf.append(ft.Text(f"  {empty_msg}", size=_s(12), italic=True))
+                    for line in (issues or [empty_msg]):
+                        buf.append(ft.Text(f"  {line}", size=_s(12),
+                                           italic=not bool(issues)))
 
-                workload     = sol.get("workload", {})
-                ref_workload = ref_sol.get("workload", {}) if ref_sol else {}
-                buf.append(ft.Text("WORKLOAD EQUITY", weight=ft.FontWeight.BOLD, size=_s(14)))
-                for p in people:
-                    ch = workload.get(p, 0)
-                    if diff_mode == "cmp" and ref_sol is not None:
-                        ph = ref_workload.get(p, 0)
-                        if ch != ph:
-                            buf.append(ft.Text(
-                                f"  {p}: {ch:.0f} h  ({ph:.0f} prev)",
-                                size=_s(12), color=ft.Colors.ORANGE_700,
-                                weight=ft.FontWeight.BOLD))
+                # ── WORKLOAD EQUITY (grouped) ─────────────────────────
+                buf.extend(self._build_workload_section(
+                    sol, people, groups or {}, diff_mode, ref_sol))
+
+                # ── TASK VARIETY EQUITY ───────────────────────────────
+                task_workload = sol.get("task_workload", {})
+                if task_workload:
+                    buf.append(ft.Text("TASK VARIETY EQUITY (BY TASK)",
+                                       weight=ft.FontWeight.BOLD, size=_s(14)))
+                    for t in tasks:
+                        buf.append(ft.Text(f"  ■ {t}", size=_s(13),
+                                           weight=ft.FontWeight.W_600,
+                                           color=ft.Colors.BLUE_GREY_800))
+                        assigned_anyone = False
+                        max_h = 0
+                        min_h = float('inf')
+                        for p in people:
+                            h_on_task = task_workload.get(p, {}).get(t, 0)
+                            if h_on_task > 0:
+                                buf.append(ft.Text(f"      • {p}: {h_on_task:.0f}h",
+                                                   size=_s(12)))
+                                assigned_anyone = True
+                                max_h = max(max_h, h_on_task)
+                                min_h = min(min_h, h_on_task)
+                        if not assigned_anyone:
+                            buf.append(ft.Text("      • Not assigned to anyone",
+                                               size=_s(12), italic=True))
                         else:
-                            buf.append(ft.Text(f"  {p}: {ch:.0f} hours", size=_s(12)))
-                    else:
-                        buf.append(ft.Text(f"  {p}: {ch:.0f} hours", size=_s(12)))
-                buf.append(ft.Text(
-                    f"  Global range: "
-                    f"max={sol.get('workload_max', 0):.0f}, "
-                    f"min={sol.get('workload_min', 0):.0f}",
-                    size=_s(12), italic=True))
+                            buf.append(ft.Text(
+                                f"      ↳ Range: Max={max_h:.0f}h  Min={min_h:.0f}h  "
+                                f"Diff={max_h - min_h:.0f}h",
+                                size=_s(11), italic=True, color=ft.Colors.GREY_700))
 
         max_hrs   = max((len(hours[d]) for d in days), default=0)
-        col_width = max(NW + CW * max_hrs + TW + _s(30), _s(460))
+        col_width = max(NW + CW * max_hrs + TW + _s(30), _s(500))
         return ft.Container(
-            content=ft.Column(controls=buf, spacing=_s(5), tight=True),
+            content=ft.ListView(controls=buf, spacing=_s(5), expand=True),
             width=col_width,
             padding=ft.padding.symmetric(horizontal=_s(16)),
             border=ft.border.only(right=ft.border.BorderSide(1, "#B0BEC5")))
 
     def rebuild(self, live_sol=None, live_people=None, live_tasks=None,
                 live_hours=None, live_days=None,
-                live_avail=None, live_emerg=None):
+                live_avail=None, live_emerg=None, live_groups=None):
         s    = self.state
         cols = []
 
@@ -1839,6 +2170,7 @@ class OutputTab:
                 i, entry["sol"], entry["people"], entry["tasks"],
                 entry["hours"], entry["days"],
                 entry["availability"], entry["emergency"],
+                groups=entry.get("groups", {}),       # ← pass stored groups
                 on_delete=_make_delete(i)))
 
         cols.reverse()
@@ -1847,22 +2179,14 @@ class OutputTab:
             cols.insert(0, self._build_run_column(
                 len(s.solution_history), live_sol,
                 live_people, live_tasks, live_hours, live_days,
-                live_avail, live_emerg, is_live=True))
+                live_avail, live_emerg,
+                groups=live_groups,                   # ← pass live groups
+                is_live=True))
 
-        self._ct.controls = (
-            [ft.Row(controls=cols, spacing=0, wrap=False,
-                    vertical_alignment=ft.CrossAxisAlignment.START)]
-            if cols else [])
+        self._ct.controls = cols
 
     def get_container(self) -> ft.Container:
-        return ft.Container(
-            content=ft.Row(
-                controls=[self._ct],
-                scroll=ft.ScrollMode.ALWAYS,
-                expand=True,
-                vertical_alignment=ft.CrossAxisAlignment.START),
-            padding=_s(10), expand=True)
-
+        return ft.Container(content=self._ct, padding=_s(10), expand=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SOLVER CONTROLLER
@@ -1875,14 +2199,14 @@ class SolverController:
                  on_solve_blocked_update,
                  switch_page_cb,
                  ui_lock: threading.Lock,
-                 day_heuristics_sw: ft.Switch):
+                 live_callbacks_sw: ft.Switch):
         self.state    = state
         self.page     = page
         self._out     = output_tab
         self._upd     = on_solve_blocked_update
         self._switch  = switch_page_cb
         self._lock    = ui_lock
-        self._sw_heur = day_heuristics_sw
+        self._sw_live = live_callbacks_sw
 
     def do_solve(self, e):
         s = self.state
@@ -1892,6 +2216,9 @@ class SolverController:
             return
 
         people, tasks, hours, days = s.dims()
+
+        # ── Build groups dict ─────────────────────────────────────────
+        groups = s.build_groups(people)
 
         max_consec: dict = {}
         if s.consec_personalized:
@@ -1946,11 +2273,14 @@ class SolverController:
             people=people, tasks=tasks, hours=hours, days=days,
             availability=availability, emergency=emergency,
             demand=demand,
-            skills   = {(p, t): s.skills_st.get((p, t), 1) for p in people for t in tasks},
+            skills   = {(p, t): s.skills_st.get((p, t), 1)
+                        for p in people for t in tasks},
             force    = {(p, t, h, j): s.force_st.get((p, t, h, j), 0)
-                        for p in people for t in tasks for j in days for h in hours[j]},
+                        for p in people for t in tasks
+                        for j in days for h in hours[j]},
             social   = {(p1, p2): s.social_st.get((p1, p2), 0)
-                        for i, p1 in enumerate(people) for p2 in people[i + 1:]},
+                        for i, p1 in enumerate(people)
+                        for p2 in people[i + 1:]},
             min_quota=mq,
             pref_cost={(p, t): 1 for p in people for t in tasks},
             rotation ={t: s.rotation_st.get(t, 1) for t in tasks},
@@ -1960,13 +2290,15 @@ class SolverController:
             captains         = [p for p in people if s.captains_st.get(p, 0) == 1],
             solver_params    = s.solver_params,
             hard_enemies     = s.hard_enemies,
-            day_heuristics   = 1 if self._sw_heur.value else 0,
+            live_callbacks   = 1 if self._sw_live.value else 0,
+            groups           = groups,       # ← passed to solve_model
         )
 
         self._out.rebuild(
             live_sol={"status": live_status, "assignment": {}},
             live_people=people, live_tasks=tasks, live_hours=hours,
-            live_days=days, live_avail=availability, live_emerg=emergency)
+            live_days=days, live_avail=availability, live_emerg=emergency,
+            live_groups=groups)
         self._switch(8)
 
         def _update_ui(partial_sol):
@@ -1976,7 +2308,8 @@ class SolverController:
                 self._out.rebuild(
                     live_sol=partial_sol,
                     live_people=people, live_tasks=tasks, live_hours=hours,
-                    live_days=days, live_avail=availability, live_emerg=emergency)
+                    live_days=days, live_avail=availability, live_emerg=emergency,
+                    live_groups=groups)
                 self.page.update()
             except Exception:
                 pass
@@ -1987,7 +2320,7 @@ class SolverController:
             try:
                 final = solve_model(
                     data,
-                    ui_update_callback=_update_ui,
+                    ui_update_callback=_update_ui if self._sw_live.value else None,
                     active_model_ref=s.running_model_ref)
                 s.solution_history.append({
                     "sol":          final,
@@ -1997,6 +2330,7 @@ class SolverController:
                     "days":         days,
                     "availability": availability,
                     "emergency":    emergency,
+                    "groups":       groups,    # ← stored in history
                 })
                 s.base_run_idx = None
                 self._out.rebuild()
@@ -2015,7 +2349,6 @@ class SolverController:
     def do_stop(self, e):
         if self.state.running_model_ref[0] is not None:
             self.state.running_model_ref[0].terminate()
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STAFF SCHEDULER APP
@@ -2090,9 +2423,10 @@ class StaffSchedulerApp:
             border_radius=8, on_click=self._do_stop,
             width=SIDEBAR_WIDTH - _s(32), alignment=ft.alignment.center)
 
-        self._day_heuristics_sw = ft.Switch(
-            label="Day Heuristics", value=False,
-            label_style=ft.TextStyle(color=ft.Colors.WHITE, size=_s(11)))
+        self._live_callbacks_sw = ft.Switch(
+            label="Live Preview", value=True,
+            label_style=ft.TextStyle(color=ft.Colors.WHITE, size=_s(11)),
+            tooltip="Show intermediate solutions while solving (slightly slower)")
 
         self._solver = SolverController(
             state=s, page=self.page,
@@ -2100,7 +2434,7 @@ class StaffSchedulerApp:
             on_solve_blocked_update=self._update_solve_blocked,
             switch_page_cb=self._switch_page,
             ui_lock=self._ui_lock,
-            day_heuristics_sw=self._day_heuristics_sw)
+            live_callbacks_sw=self._live_callbacks_sw)
 
         self._page_contents = {
             0: self._dims_tab.get_container(),
@@ -2124,7 +2458,7 @@ class StaffSchedulerApp:
         }
 
         _menu_def = [
-            ("Dimensions",   ft.Icons.GRID_VIEW,           0),
+            ("Dimensions",   ft.Icons.GRID_VIEW,            0),
             ("Availability", ft.Icons.EVENT_AVAILABLE,      1),
             ("Demand",       ft.Icons.TRENDING_UP,          2),
             ("Skills",       ft.Icons.STAR_BORDER,          3),
@@ -2168,7 +2502,9 @@ class StaffSchedulerApp:
                         padding=ft.padding.only(left=_s(8), bottom=_s(4))),
                     ft.Container(
                         ft.Column([
-                            self._solve_btn, self._day_heuristics_sw, self._stop_btn,
+                            self._solve_btn,
+                            self._live_callbacks_sw,
+                            self._stop_btn,
                         ], spacing=_s(6)),
                         padding=ft.padding.only(bottom=_s(8))),
                     ft.Divider(color="#455A64", height=1),
@@ -2208,13 +2544,11 @@ class StaffSchedulerApp:
     def _do_stop(self, e):
         self._solver.do_stop(e)
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
+# MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main(page: ft.Page):
     StaffSchedulerApp(page)
-
 
 ft.app(target=main)

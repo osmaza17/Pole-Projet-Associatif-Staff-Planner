@@ -1,3 +1,8 @@
+import os
+from pathlib import Path
+os.environ["GRB_LICENSE_FILE"] = str(Path(__file__).parent / "gurobi.lic")
+
+
 import time
 import logging
 import gurobipy as gp
@@ -454,6 +459,8 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
                 except Exception as exc:
                     logging.warning(f"Solver callback error (non-fatal): {exc}")
 
+
+            model.write(os.path.join(os.path.dirname(__file__), "staffscheduler_tune.mps"))
             model.optimize(intermediate_solution_callback)
 
             # ── Accumulate results ────────────────────────────────────

@@ -1,11 +1,8 @@
-
-
-
 import flet as ft
 import random
 import threading
 
-from solve_model_pace_10 import solve_model
+from solve_model_pace_11 import solve_model
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -23,7 +20,7 @@ def _s(v: float) -> int:
 # ══════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_WEIGHTS = {
-    "W_COVERAGE": 300000, "W_FORCE": 100000, "W_CAPTAIN": 10000,
+    "W_COVERAGE": 30000, "W_FORCE": 10000, "W_CAPTAIN": 8000,
     "W_STABILITY": 7000, "W_EQ_DAY": 5000, "W_GAP": 1000,
     "W_EMERG": 750,      "W_EQ_GLOBAL": 500, "W_ROTATION": 100,
     "W_SOCIAL": 50,      "W_QUOTA": 10,      "W_PREF": 1,
@@ -269,11 +266,8 @@ class UIHelpers:
              for lbl in labels],
             spacing=2, wrap=False)
 
-    # ── Generic row/col toggle button ─────────────────────────────────────
-
     @staticmethod
     def make_rc_btn(label: str = "·") -> ft.Container:
-        """Bare blue-grey button shell; caller sets on_click."""
         return ft.Container(
             ft.Text(label, color=ft.Colors.WHITE, size=_s(10),
                     text_align=ft.TextAlign.CENTER),
@@ -283,7 +277,6 @@ class UIHelpers:
 
     @staticmethod
     def make_inc_btn(delta: int) -> ft.Container:
-        """Green (+1) or red (-1) increment button shell; caller sets on_click."""
         label = "+1" if delta > 0 else "-1"
         color = ft.Colors.GREEN_700 if delta > 0 else ft.Colors.RED_700
         return ft.Container(
@@ -683,8 +676,6 @@ class DimensionsTab:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AVAILABILITY TAB
-# Row buttons already existed; col buttons added.
-# Both use cell_map for in-place updates (no full rebuild).
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AvailabilityTab(BaseTab):
@@ -734,7 +725,6 @@ class AvailabilityTab(BaseTab):
 
         buf.append(ft.Text(f"-- {j} --", weight=ft.FontWeight.BOLD, size=_s(14)))
 
-        # ── Hour-label header row ──────────────────────────────────────────
         buf.append(ft.Row(
             [ft.Container(width=UIHelpers.W_LBL + UIHelpers.W_CELL + 4)] +
             [ft.Container(ft.Text(h, size=_s(9), no_wrap=True, overflow=ft.TextOverflow.CLIP),
@@ -742,7 +732,6 @@ class AvailabilityTab(BaseTab):
              for h in day_hrs],
             spacing=2, wrap=False))
 
-        # ── Col-toggle buttons row ─────────────────────────────────────────
         def _make_col_toggle(_h):
             btn = UIHelpers.make_rc_btn("col")
             def _click(e, __h=_h):
@@ -763,7 +752,6 @@ class AvailabilityTab(BaseTab):
             [_make_col_toggle(h) for h in day_hrs],
             spacing=2, wrap=False))
 
-        # ── Person rows with row-toggle buttons ────────────────────────────
         for p in people:
             def _row_toggle(_p=p, _j=j):
                 btn = UIHelpers.make_rc_btn("row")
@@ -796,7 +784,7 @@ class AvailabilityTab(BaseTab):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DEMAND TAB  (unchanged from original)
+# DEMAND TAB
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DemandTab(BaseTab):
@@ -861,7 +849,6 @@ class DemandTab(BaseTab):
 
         buf += [ft.Text(f"-- {j} --", weight=ft.FontWeight.BOLD, size=_s(14)), err_txt]
 
-        # ── helpers ────────────────────────────────────────────────────────
         _spacer = ft.Container(width=UIHelpers.W_LBL + UIHelpers.W_CELL + 2)
 
         def _adj(k, delta):
@@ -892,9 +879,7 @@ class DemandTab(BaseTab):
             btn.on_click = _click
             return btn
 
-        # top +1 col buttons
         buf.append(ft.Row([_spacer] + [_col_btn(h, +1) for h in day_hrs], spacing=2, wrap=False))
-        # hour header labels
         buf.append(ft.Row(
             [_spacer] +
             [ft.Container(ft.Text(h, size=_s(9), no_wrap=True, overflow=ft.TextOverflow.CLIP),
@@ -932,7 +917,6 @@ class DemandTab(BaseTab):
                 [UIHelpers.lbl(t), _row_btn(t, +1)] + cells + [_row_btn(t, -1)],
                 spacing=2, wrap=False))
 
-        # bottom -1 col buttons
         buf.append(ft.Row([_spacer] + [_col_btn(h, -1) for h in day_hrs], spacing=2, wrap=False))
 
         buf.append(ft.Divider())
@@ -941,7 +925,7 @@ class DemandTab(BaseTab):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SKILLS TAB  — row & col toggles added
+# SKILLS TAB
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SkillsTab(BaseTab):
@@ -964,7 +948,6 @@ class SkillsTab(BaseTab):
             s.invalidate_cache()
             self.build()
 
-        # ── Col toggle: flip all people for one task ───────────────────────
         def _make_col_toggle(_t):
             btn = UIHelpers.make_rc_btn("col")
             def _click(e, __t=_t):
@@ -977,7 +960,6 @@ class SkillsTab(BaseTab):
             btn.on_click = _click
             return btn
 
-        # ── Row toggle: flip all tasks for one person ──────────────────────
         def _make_row_toggle(_p):
             btn = UIHelpers.make_rc_btn("row")
             def _click(e, __p=_p):
@@ -999,16 +981,14 @@ class SkillsTab(BaseTab):
                              bgcolor=ft.Colors.PURPLE_400, padding=_s(8), border_radius=4,
                              on_click=_rand, width=_s(150), alignment=ft.alignment.center),
             ], spacing=_s(10)),
-            # header labels row
             ft.Row(
                 [ft.Container(width=UIHelpers.W_LBL),
-                 ft.Container(width=UIHelpers.W_CELL)] +   # spacer above row-btn col
+                 ft.Container(width=UIHelpers.W_CELL)] +
                 [ft.Container(
                     ft.Text(t, size=_s(9), no_wrap=True, overflow=ft.TextOverflow.CLIP),
                     width=UIHelpers.W_CELL, clip_behavior=ft.ClipBehavior.HARD_EDGE)
                  for t in tasks],
                 spacing=2, wrap=False),
-            # col-toggle row
             ft.Row(
                 [ft.Container(width=UIHelpers.W_LBL),
                  ft.Container(width=UIHelpers.W_CELL)] +
@@ -1028,7 +1008,7 @@ class SkillsTab(BaseTab):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# QUOTA TAB  (unchanged)
+# QUOTA TAB
 # ══════════════════════════════════════════════════════════════════════════════
 
 class QuotaTab(BaseTab):
@@ -1095,7 +1075,6 @@ class QuotaTab(BaseTab):
             ft.Text(f"-- {j} --", weight=ft.FontWeight.BOLD, size=_s(14)),
         ]
 
-        # ── helpers ────────────────────────────────────────────────────────
         _spacer = ft.Container(width=UIHelpers.W_LBL + UIHelpers.W_CELL + 2)
 
         def _adj(k, delta):
@@ -1126,9 +1105,7 @@ class QuotaTab(BaseTab):
             btn.on_click = _click
             return btn
 
-        # top +1 col buttons
         buf.append(ft.Row([_spacer] + [_col_btn(t, +1) for t in tasks], spacing=2, wrap=False))
-        # task header labels
         buf.append(ft.Row(
             [_spacer] +
             [ft.Container(ft.Text(t, size=_s(9), no_wrap=True, overflow=ft.TextOverflow.CLIP),
@@ -1166,7 +1143,6 @@ class QuotaTab(BaseTab):
                 [UIHelpers.plbl(p, s.captains_st), _row_btn(p, +1)] + cells + [_row_btn(p, -1)],
                 spacing=2, wrap=False))
 
-        # bottom -1 col buttons
         buf.append(ft.Row([_spacer] + [_col_btn(t, -1) for t in tasks], spacing=2, wrap=False))
 
         buf.append(ft.Divider())
@@ -1175,7 +1151,7 @@ class QuotaTab(BaseTab):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FORCE TAB  — row & col toggles added
+# FORCE TAB
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ForceTab(BaseTab):
@@ -1214,7 +1190,6 @@ class ForceTab(BaseTab):
         ti      = tasks.index(t) if t in tasks else 0
         tbg, tfg = TASK_COLORS[ti % len(TASK_COLORS)]
 
-        # ── Col toggle: flip all people for one hour ───────────────────────
         def _make_col_toggle(_h):
             btn = UIHelpers.make_rc_btn("col")
             def _click(e, __h=_h):
@@ -1226,7 +1201,6 @@ class ForceTab(BaseTab):
             btn.on_click = _click
             return btn
 
-        # ── Row toggle: flip all hours for one person ──────────────────────
         def _make_row_toggle(_p):
             btn = UIHelpers.make_rc_btn("row")
             def _click(e, __p=_p):
@@ -1247,7 +1221,6 @@ class ForceTab(BaseTab):
 
         buf.append(ft.Text(f"-- {t} / {j} --", weight=ft.FontWeight.BOLD, size=_s(14)))
 
-        # header labels
         buf.append(ft.Row(
             [ft.Container(width=UIHelpers.W_LBL),
              ft.Container(width=UIHelpers.W_CELL)] +
@@ -1257,7 +1230,6 @@ class ForceTab(BaseTab):
              for h in day_hrs],
             spacing=2, wrap=False))
 
-        # col toggles
         buf.append(ft.Row(
             [ft.Container(width=UIHelpers.W_LBL),
              ft.Container(width=UIHelpers.W_CELL)] +
@@ -1278,7 +1250,7 @@ class ForceTab(BaseTab):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SOCIAL TAB  — row & col toggles added
+# SOCIAL TAB
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SocialTab(BaseTab):
@@ -1324,9 +1296,8 @@ class SocialTab(BaseTab):
         _clr  = {0: ft.Colors.GREY_400, 1: ft.Colors.GREEN_700, -1: ft.Colors.RED_700}
         _next = {0: 1, 1: -1, -1: 0}
 
-        col_people = people[1:]   # columns shown in header
+        col_people = people[1:]
 
-        # ── Col toggle: flip all (p1, p2) pairs where p1 comes before p2 ──
         def _make_col_toggle(_p2):
             p2_idx = people.index(_p2)
             btn = UIHelpers.make_rc_btn("col")
@@ -1343,7 +1314,6 @@ class SocialTab(BaseTab):
             btn.on_click = _click
             return btn
 
-        # ── Row toggle: flip all (p1, p2) pairs where p2 comes after p1 ───
         def _make_row_toggle(_p1):
             p1_idx = people.index(_p1)
             btn = UIHelpers.make_rc_btn("row")
@@ -1360,7 +1330,6 @@ class SocialTab(BaseTab):
             btn.on_click = _click
             return btn
 
-        # header labels row  [spacer_name | spacer_rowbtn | label_p2 ...]
         buf.append(ft.Row(
             [ft.Container(width=UIHelpers.W_LBL),
              ft.Container(width=UIHelpers.W_CELL)] +
@@ -1370,14 +1339,12 @@ class SocialTab(BaseTab):
              for p in col_people],
             spacing=2, wrap=False))
 
-        # col-toggle row  [spacer_name | spacer_rowbtn | col_btn_p2 ...]
         buf.append(ft.Row(
             [ft.Container(width=UIHelpers.W_LBL),
              ft.Container(width=UIHelpers.W_CELL)] +
             [_make_col_toggle(p2) for p2 in col_people],
             spacing=2, wrap=False))
 
-        # person rows
         for i, p1 in enumerate(people):
             cells = []
             for p2 in col_people:
@@ -1875,7 +1842,8 @@ class SolverController:
                  on_solve_blocked_update,
                  switch_page_cb,
                  ui_lock: threading.Lock,
-                 day_heuristics_sw: ft.Switch):
+                 day_heuristics_sw: ft.Switch,
+                 live_callbacks_sw: ft.Switch):          # ← NUEVO parámetro
         self.state    = state
         self.page     = page
         self._out     = output_tab
@@ -1883,6 +1851,7 @@ class SolverController:
         self._switch  = switch_page_cb
         self._lock    = ui_lock
         self._sw_heur = day_heuristics_sw
+        self._sw_live = live_callbacks_sw                 # ← NUEVO atributo
 
     def do_solve(self, e):
         s = self.state
@@ -1961,6 +1930,7 @@ class SolverController:
             solver_params    = s.solver_params,
             hard_enemies     = s.hard_enemies,
             day_heuristics   = 1 if self._sw_heur.value else 0,
+            live_callbacks   = 1 if self._sw_live.value else 0,   # ← NUEVO flag
         )
 
         self._out.rebuild(
@@ -1987,7 +1957,7 @@ class SolverController:
             try:
                 final = solve_model(
                     data,
-                    ui_update_callback=_update_ui,
+                    ui_update_callback=_update_ui if self._sw_live.value else None,
                     active_model_ref=s.running_model_ref)
                 s.solution_history.append({
                     "sol":          final,
@@ -2090,9 +2060,16 @@ class StaffSchedulerApp:
             border_radius=8, on_click=self._do_stop,
             width=SIDEBAR_WIDTH - _s(32), alignment=ft.alignment.center)
 
+        # ── Toggles de opciones del solver ────────────────────────────────
         self._day_heuristics_sw = ft.Switch(
             label="Day Heuristics", value=False,
             label_style=ft.TextStyle(color=ft.Colors.WHITE, size=_s(11)))
+
+        # ★ NUEVO: toggle para activar/desactivar intermediate callbacks
+        self._live_callbacks_sw = ft.Switch(
+            label="Live Preview", value=True,
+            label_style=ft.TextStyle(color=ft.Colors.WHITE, size=_s(11)),
+            tooltip="Show intermediate solutions while solving (slightly slower)")
 
         self._solver = SolverController(
             state=s, page=self.page,
@@ -2100,7 +2077,8 @@ class StaffSchedulerApp:
             on_solve_blocked_update=self._update_solve_blocked,
             switch_page_cb=self._switch_page,
             ui_lock=self._ui_lock,
-            day_heuristics_sw=self._day_heuristics_sw)
+            day_heuristics_sw=self._day_heuristics_sw,
+            live_callbacks_sw=self._live_callbacks_sw)    # ← NUEVO argumento
 
         self._page_contents = {
             0: self._dims_tab.get_container(),
@@ -2168,7 +2146,10 @@ class StaffSchedulerApp:
                         padding=ft.padding.only(left=_s(8), bottom=_s(4))),
                     ft.Container(
                         ft.Column([
-                            self._solve_btn, self._day_heuristics_sw, self._stop_btn,
+                            self._solve_btn,
+                            self._day_heuristics_sw,
+                            self._live_callbacks_sw,   # ← NUEVO toggle en sidebar
+                            self._stop_btn,
                         ], spacing=_s(6)),
                         padding=ft.padding.only(bottom=_s(8))),
                     ft.Divider(color="#455A64", height=1),
