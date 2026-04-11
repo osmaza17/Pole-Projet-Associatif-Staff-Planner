@@ -10,6 +10,9 @@ from gurobipy import GRB
 from collections import defaultdict, Counter
 
 
+TRAVEL_LABEL = "TRAVEL"
+
+
 def solve_model(data, ui_update_callback=None, active_model_ref=None):
 
     # ══════════════════════════════════════════════════════════════════
@@ -33,10 +36,13 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
     sticky           = data.get("sticky", {})
     rotation         = data.get("rotation", {})
     task_duration    = data.get("task_duration", {})
-    capacity = data.get("capacity", {}) 
-    max_hours_per_day   = data.get("max_hours_per_day", {})    # {person: int} or {}
-    max_hours_per_event = data.get("max_hours_per_event", {})  # {person: int} or {}
-    task_priority = data.get("task_priority", {})
+    capacity         = data.get("capacity", {})
+    max_hours_per_day   = data.get("max_hours_per_day", {})
+    max_hours_per_event = data.get("max_hours_per_event", {})
+    task_priority       = data.get("task_priority", {})
+
+    task_location = data.get("task_location", {})
+    travel_time   = data.get("travel_time", {})
 
     if not data.get("live_callbacks", 1):
         ui_update_callback = None
@@ -53,20 +59,16 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
     W_STICKY     = W.get("W_STICKY", 0)
     W_DURATION   = W.get("W_DURATION", 0)
     W_ROTATION   = W.get("W_ROTATION", 0)
+    W_TRAVEL     = W.get("W_TRAVEL", 0)
 
     # ══════════════════════════════════════════════════════════════════
     # GROUPS
     # ══════════════════════════════════════════════════════════════════
     raw_groups = data.get("groups", {}) or {"default": list(people)}
-
     group_list       = list(raw_groups.keys())
-
     number_of_groups = len(group_list)
-
     group_people     = {g: raw_groups[g] for g in group_list}
-
     person_to_group  = {p: g for g, members in group_people.items() for p in members}
-
     cap = {p: capacity.get(p, 1.0) for p in people}
 
     # ══════════════════════════════════════════════════════════════════
@@ -117,8 +119,6 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
 
     multi_hour_tasks = {t: task_duration[t] for t in tasks if task_duration.get(t, 1) > 1}
 
-    # ── Effective rotation set: drop tasks that require continuity by
-    #    design, so BLOCK 14 cannot fight BLOCK 0b or BLOCK 13.
     effective_rotation_tasks = (
         rotation_tasks - set(multi_hour_tasks) - sticky_tasks
     )
@@ -134,7 +134,6 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
                         if h in hours.get(d, []) and demand.get((t, h, d), 0) > 0:
                             captain_slots_per_day[d].append((r_idx, t, h, caps, min_req))
 
-    # ── Quota rules — preprocessing ──────────────────────────────────
     people_set, tasks_set = set(people), set(tasks)
     quota_rules_valid = []
     for r_idx, rule in enumerate(quota_rules):
@@ -146,7 +145,6 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
             quota_rules_valid.append({"idx": r_idx, "people": r_people,
                                       "tasks": r_tasks, "days": r_days})
 
-    # ── Pacing — cumulative demand targets ───────────────────────────
     demand_per_day    = {d: sum(demand[k] for k in demand_set_per_day[d]) for d in days}
     total_demand      = sum(demand_per_day.values())
     cumulative_demand = {}
@@ -158,6 +156,25 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
     accumulated_hours       = {p: 0 for p in people}
     accumulated_task_hours  = defaultdict(int)
     accumulated_group_hours = {g: 0 for g in group_list}
+
+    # ── Travel precomputations ───────────────────────────────────────
+    travel_cost: dict[tuple[str, str], int] = {}
+    for (l1, l2), k in travel_time.items():
+        if k > 0:
+            travel_cost[(l1, l2)] = k
+            travel_cost[(l2, l1)] = k
+
+    loc_of = {t: task_location.get(t, "__same__") for t in tasks}
+
+    task_pairs_with_travel: list[tuple[str, str, int]] = []
+    for t1 in tasks:
+        for t2 in tasks:
+            if t1 >= t2:
+                continue
+            l1, l2 = loc_of[t1], loc_of[t2]
+            k = travel_cost.get((l1, l2), 0)
+            if k > 0:
+                task_pairs_with_travel.append((t1, t2, k))
 
     # ══════════════════════════════════════════════════════════════════
     # RESULT ACCUMULATORS
@@ -201,6 +218,7 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
                 forced_tasks_set_today = forced_tasks_set_per_day[today]
                 must_work_set_today    = must_work_set_per_day[today]
                 hours_today            = hours[today]
+                h_to_idx               = {h: i for i, h in enumerate(hours_today)}
 
                 with gp.Model("StaffScheduler", env=env) as model:
 
@@ -238,11 +256,17 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
 
                     people_with_x_today = {p for p, t, h, _ in x_set}
 
+                    # ── Shared index for travel blocks ────────────────
+                    _pt_idx: dict[tuple, list] = defaultdict(list)
+                    if task_pairs_with_travel:
+                        for p, t, h, _ in x_set:
+                            _pt_idx[(p, t)].append((h_to_idx[h], h))
+
                     # ╔══════════════════════════════════════════════════╗
                     # ║  BLOCK 0b — MULTI-HOUR TASK DURATION (soft)      ║
                     # ╚══════════════════════════════════════════════════╝
                     if W_DURATION > 0 and multi_hour_tasks:
-                        covers = defaultdict(list)   # (p,t,h) → [start_hours]
+                        covers = defaultdict(list)
                         s_set  = set()
 
                         for t, dur in multi_hour_tasks.items():
@@ -435,30 +459,99 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
                             z[k] >= x[k] - X_prev.get(k, 0) for k in x_set)
 
                     # ╔══════════════════════════════════════════════════╗
-                    # ║  BLOCK 8 — GAPS                                 ║
+                    # ║  BLOCK 7b — TRANSIT DETECTION (before gaps)      ║
+                    # ╚══════════════════════════════════════════════════╝
+                    in_transit_keys: set = set()
+                    in_transit_vars: dict = {}
+
+                    if task_pairs_with_travel and W_GAP > 0:
+                        _tlinks: list = []
+                        for t1, t2, k in task_pairs_with_travel:
+                            for p in people_with_x_today:
+                                pts1 = _pt_idx.get((p, t1), [])
+                                pts2 = _pt_idx.get((p, t2), [])
+                                if not pts1 or not pts2:
+                                    continue
+                                for i1, h1 in pts1:
+                                    for i2, h2 in pts2:
+                                        if i2 > i1:
+                                            for mi in range(i1 + 1, min(i1 + k + 1, i2)):
+                                                hm = hours_today[mi]
+                                                in_transit_keys.add((p, hm, today))
+                                                _tlinks.append((p, t1, h1, t2, h2, hm))
+                                        elif i1 > i2:
+                                            for mi in range(i2 + 1, min(i2 + k + 1, i1)):
+                                                hm = hours_today[mi]
+                                                in_transit_keys.add((p, hm, today))
+                                                _tlinks.append((p, t2, h2, t1, h1, hm))
+
+                        if in_transit_keys:
+                            in_transit_vars = model.addVars(in_transit_keys, vtype=GRB.BINARY)
+                            for p, ta, ha, tb, hb, hm in _tlinks:
+                                model.addConstr(
+                                    in_transit_vars[p, hm, today]
+                                    >= x[p, ta, ha, today] + x[p, tb, hb, today] - 1)
+
+                    # ╔══════════════════════════════════════════════════╗
+                    # ║  BLOCK 8 — GAPS (transit-aware)                  ║
                     # ╚══════════════════════════════════════════════════╝
                     if W_GAP > 0:
                         g_keys = {(p, h, today) for p, t, h, _ in x_set}
                         r_keys = [(p, today) for p in people_with_x_today]
 
-                        g = model.addVars(g_keys, vtype=GRB.BINARY)
+                        g  = model.addVars(g_keys, vtype=GRB.BINARY)
                         rr = model.addVars(r_keys, lb=0, vtype=GRB.INTEGER)
                         obj += W_GAP * rr.sum()
 
-                        model.addConstrs(
-                            g[p, hours_today[0], today] == x.sum(p, '*', hours_today[0], today)
-                            for p in people_with_x_today
-                            if (p, hours_today[0], today) in g_keys)
+                        if in_transit_keys:
+                            # ── Build 'active' = OR(working, in_transit) ──
+                            active_keys = g_keys | in_transit_keys
+                            act = model.addVars(active_keys, vtype=GRB.BINARY)
 
-                        model.addConstrs(
-                            g[p, hn, today] >= x.sum(p, '*', hn, today) - x.sum(p, '*', hb, today)
-                            for p in people_with_x_today
-                            for hb, hn in zip(hours_today[:-1], hours_today[1:])
-                            if (p, hn, today) in g_keys)
+                            for phd in active_keys:
+                                ub_expr = gp.LinExpr()
+                                if phd in g_keys:
+                                    p_, h_, d_ = phd
+                                    xs = x.sum(p_, '*', h_, d_)
+                                    model.addConstr(act[phd] >= xs)
+                                    ub_expr += xs
+                                if phd in in_transit_keys:
+                                    model.addConstr(act[phd] >= in_transit_vars[phd])
+                                    ub_expr += in_transit_vars[phd]
+                                model.addConstr(act[phd] <= ub_expr)
+
+                            def _a(p, h):
+                                k = (p, h, today)
+                                return act[k] if k in active_keys else 0
+
+                            model.addConstrs(
+                                g[p, hours_today[0], today] >= _a(p, hours_today[0])
+                                for p in people_with_x_today
+                                if (p, hours_today[0], today) in g_keys)
+
+                            model.addConstrs(
+                                g[p, hn, today] >= _a(p, hn) - _a(p, hb)
+                                for p in people_with_x_today
+                                for hb, hn in zip(hours_today[:-1], hours_today[1:])
+                                if (p, hn, today) in g_keys)
+                        else:
+                            # ── Original gap detection (no transit) ────
+                            model.addConstrs(
+                                g[p, hours_today[0], today] == x.sum(p, '*', hours_today[0], today)
+                                for p in people_with_x_today
+                                if (p, hours_today[0], today) in g_keys)
+
+                            model.addConstrs(
+                                g[p, hn, today] >= x.sum(p, '*', hn, today)
+                                                 - x.sum(p, '*', hb, today)
+                                for p in people_with_x_today
+                                for hb, hn in zip(hours_today[:-1], hours_today[1:])
+                                if (p, hn, today) in g_keys)
 
                         model.addConstrs(
                             rr[p, today] >= gp.quicksum(
-                                g[p, h, today] for h in hours_today if (p, h, today) in g_keys) - 1
+                                g[p, h, today] for h in hours_today
+                                if (p, h, today) in g_keys) - 1
                             for p, _ in r_keys)
 
                     # ╔══════════════════════════════════════════════════╗
@@ -559,7 +652,7 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
                                 model.addConstrs(
                                     x.sum(person, '*', hours_today[s:s + window], today) <= max_work
                                     for s in range(len(hours_today) - window + 1))
-                                
+
                     # ╔══════════════════════════════════════════════════════════════╗
                     # ║  BLOCK 12b — MAX HOURS PER DAY / PER EVENT (hard)            ║
                     # ╚══════════════════════════════════════════════════════════════╝
@@ -595,11 +688,6 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
                     # ╔══════════════════════════════════════════════════╗
                     # ║  BLOCK 14 — ROTATION (anti-repetition)           ║
                     # ╚══════════════════════════════════════════════════╝
-                    # Penalize each consecutive-hour pair on the same task
-                    # for the same person, to promote rotation and avoid
-                    # boredom. Multi-hour and sticky tasks are excluded
-                    # upstream (effective_rotation_tasks) so this block
-                    # never fights BLOCK 0b or BLOCK 13.
                     if W_ROTATION > 0 and effective_rotation_tasks:
                         rot_keys = [
                             (p, t, h, today)
@@ -617,6 +705,73 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
                                 + x[p, t, h_next_all[(h, today)], today]
                                 - c_rot[p, t, h, today] <= 1
                                 for p, t, h, _ in rot_keys)
+
+                    # ╔══════════════════════════════════════════════════╗
+                    # ║  BLOCK 15 — TRAVEL TIME (hard)                   ║
+                    # ╚══════════════════════════════════════════════════╝
+                    if task_pairs_with_travel:
+                        for t1, t2, k in task_pairs_with_travel:
+                            for p in people_with_x_today:
+                                pts1 = _pt_idx.get((p, t1), [])
+                                pts2 = _pt_idx.get((p, t2), [])
+                                if not pts1 or not pts2:
+                                    continue
+                                for i1, h1 in pts1:
+                                    for i2, h2 in pts2:
+                                        if 0 < abs(i2 - i1) <= k:
+                                            model.addConstr(
+                                                x[p, t1, h1, today]
+                                                + x[p, t2, h2, today] <= 1)
+
+                    # ╔══════════════════════════════════════════════════╗
+                    # ║  BLOCK 15b — TRAVEL PENALTY (soft)               ║
+                    # ╚══════════════════════════════════════════════════╝
+                    if W_TRAVEL > 0 and task_pairs_with_travel:
+                        # (1) Solo locs conectadas por pares con travel_cost > 0
+                        locs_with_travel = set()
+                        for t1, t2, k in task_pairs_with_travel:
+                            if k > 0:
+                                locs_with_travel.add(loc_of[t1])
+                                locs_with_travel.add(loc_of[t2])
+
+                        if len(locs_with_travel) > 1:
+                            # (4) uses_loc solo para (p, loc) realmente alcanzables
+                            p_locs: dict[str, set] = {}
+                            for p, t, h, _ in x_set:
+                                loc = loc_of[t]
+                                if loc in locs_with_travel:
+                                    p_locs.setdefault(p, set()).add(loc)
+
+                            ul_keys = [(p, loc) for p, locs in p_locs.items() for loc in locs]
+                            if ul_keys:
+                                uses_loc = model.addVars(ul_keys, vtype=GRB.BINARY)
+
+                                for p, t, h, _ in x_set:
+                                    loc = loc_of[t]
+                                    if (p, loc) in uses_loc:
+                                        model.addConstr(uses_loc[p, loc] >= x[p, t, h, today])
+
+                                # (2) Penalización ponderada por travel_cost entre pares de locs visitadas
+                                pair_keys = []
+                                pair_weight: dict = {}
+                                for p, locs in p_locs.items():
+                                    locs_list = sorted(locs)
+                                    for i in range(len(locs_list)):
+                                        for j in range(i + 1, len(locs_list)):
+                                            l1, l2 = locs_list[i], locs_list[j]
+                                            k = travel_cost.get((l1, l2), 0)
+                                            if k > 0:
+                                                pair_keys.append((p, l1, l2))
+                                                pair_weight[p, l1, l2] = k
+
+                                if pair_keys:
+                                    uses_pair = model.addVars(pair_keys, vtype=GRB.BINARY)
+                                    for (p, l1, l2) in pair_keys:
+                                        model.addConstr(
+                                            uses_pair[p, l1, l2]
+                                            >= uses_loc[p, l1] + uses_loc[p, l2] - 1)
+                                    obj += W_TRAVEL * gp.quicksum(
+                                        pair_weight[k_] * uses_pair[k_] for k_ in pair_keys)
 
                     # ══════════════════════════════════════════════════
                     # OBJECTIVE & PARAMS & OPTIMIZE
@@ -700,11 +855,35 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
         raise RuntimeError(f"Gurobi error: {e}") from e
 
     # ══════════════════════════════════════════════════════════════════
-    # RESULTS
+    # POST-PROCESSING: label TRAVEL slots
     # ══════════════════════════════════════════════════════════════════
     assignment = partial_assignment
 
-    # ── Counters ─────────────────────────────────────────────────────
+    if task_pairs_with_travel:
+        for d in days:
+            hrs = hours[d]
+            for p in people:
+                slots = assignment[d][p]
+                assigned_list = [
+                    (i, h, slots[h])
+                    for i, h in enumerate(hrs)
+                    if slots[h] is not None and slots[h] != TRAVEL_LABEL
+                ]
+                for a_pos in range(len(assigned_list) - 1):
+                    i_a, h_a, t_a = assigned_list[a_pos]
+                    i_b, h_b, t_b = assigned_list[a_pos + 1]
+                    l_a = loc_of.get(t_a, "__same__")
+                    l_b = loc_of.get(t_b, "__same__")
+                    k = travel_cost.get((l_a, l_b), 0)
+                    if k <= 0:
+                        continue
+                    for gi in range(i_a + 1, min(i_b, i_a + k + 1)):
+                        if slots[hrs[gi]] is None:
+                            slots[hrs[gi]] = TRAVEL_LABEL
+
+    # ══════════════════════════════════════════════════════════════════
+    # RESULTS
+    # ══════════════════════════════════════════════════════════════════
     assigned_counts       = {p: 0 for p in people}
     task_hours_per_person = Counter()
     active_slots          = set()
@@ -715,7 +894,6 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
             task_hours_per_person[(p, t)] += 1
             active_slots.add((p, t, h, d))
 
-    # ── Build sol dict ───────────────────────────────────────────────
     sol = {
         "solve_time":         time.monotonic() - solve_start,
         "status":             final_status,
@@ -727,13 +905,12 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
         "workload_max":       float(max(assigned_counts.values())) if assigned_counts else 0.0,
         "workload_min":       float(min(assigned_counts.values())) if assigned_counts else 0.0,
         "task_workload":      {p: {t: task_hours_per_person.get((p, t), 0) for t in tasks} for p in people},
+        "travel_label":       TRAVEL_LABEL if task_pairs_with_travel else None,
     }
 
-    # ── Missing staff ────────────────────────────────────────────────
     sol["missing"] = [f"{t} @ {h}, {d}: {v:.0f} missing"
                       for (t, h, d), v in all_m_vals.items() if v > 0.01]
 
-    # ── Force mandates — only violations ─────────────────────────────
     force_violations = []
     if W_FORCE > 0 and all_u_vals:
         for d in days:
@@ -742,7 +919,6 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
                     force_violations.append(f"{p} — '{t}' @ {h}, {d}")
     sol["force_violations"] = force_violations
 
-    # ── Just work — only violations ──────────────────────────────────
     jw_violations = []
     if all_u_any_vals:
         for d in days:
@@ -751,7 +927,6 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
                     jw_violations.append(f"{p} @ {h}, {d}")
     sol["just_work_violations"] = jw_violations
 
-    # ── Just rest — only violations ──────────────────────────────────
     jr_violations = []
     if all_u_rest_vals:
         for d in days:
@@ -761,7 +936,6 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
                     jr_violations.append(f"{p} @ {h}, {d} → '{assigned_task}'")
     sol["just_rest_violations"] = jr_violations
 
-    # ── Captain — only violations ────────────────────────────────────
     captain_violations = []
     if W_CAPTAIN > 0 and captain_rules and all_w_vals:
         for d in days:
@@ -772,7 +946,6 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
                         f"(need {min_req}, captains: [{', '.join(caps)}])")
     sol["captain_violations"] = captain_violations
 
-    # ── Quota — only violations ──────────────────────────────────────
     quota_violations = []
     for r in quota_rules_valid:
         for task, req in r["tasks"].items():
@@ -785,7 +958,6 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
                             f"Rule #{r['idx']+1} — {person} → '{task}' on {day}: {actual}/{req}h")
     sol["quota_violations"] = quota_violations
 
-    # ── Social — only enemy violations ───────────────────────────────
     slots_per_person = defaultdict(set)
     for p, t, h, d in active_slots:
         slots_per_person[p].add((t, h, d))
@@ -798,13 +970,11 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
                     enemy_violations.append(f"{p1} & {p2} @ {t}, {h}, {d}")
     sol["enemy_violations"] = enemy_violations
 
-    # ── Emergency call-ins ───────────────────────────────────────────
     sol["emerg_issues"] = [
         f"{p} @ {t}, {h}, {d}"
         for p, t, h, d in active_slots
         if (p, h, d) in emergency_set]
 
-    # ── Group workload ───────────────────────────────────────────────
     group_target_total = total_demand / number_of_groups
     sol["group_workload"] = {}
     for g in group_list:
@@ -820,7 +990,6 @@ def solve_model(data, ui_update_callback=None, active_model_ref=None):
             "members":           group_people[g],
         }
 
-    # ── Variety report ───────────────────────────────────────────────
     variety_report = []
     for t in tasks:
         qualified = people_per_task[t]

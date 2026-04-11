@@ -2,9 +2,6 @@
 profile_io.py
 =============
 Serializes / deserializes the AppState to/from a JSON string.
-
-NOTE: backward compatibility was intentionally dropped per user request.
-Old profiles that contain `quota_st` will simply lose their quota data.
 """
 
 import json
@@ -52,6 +49,9 @@ def save_profile(s: AppState) -> str:
         "rotation_st":         s.rotation_st,
         "hard_enemies":        s.hard_enemies,
 
+        "pref_order_st":       s.pref_order_st,
+        "pref_enabled_st":     s.pref_enabled_st,
+
         "consec_global_val":            s.consec_global_val,
         "consec_global_rest":           s.consec_global_rest,
         "consec_per_person":            s.consec_per_person,
@@ -67,6 +67,11 @@ def save_profile(s: AppState) -> str:
         "weights_enabled":     s.weights_enabled,
         "weights_last_value":  s.weights_last_value,
         "solver_params":       s.solver_params,
+
+        # ── Displacement ──────────────────────────────────────────────
+        "location_names_st":    s.location_names_st,
+        "task_location_idx_st": s.task_location_idx_st,
+        "travel_time_st":       _enc(s.travel_time_st),
     }
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
@@ -88,6 +93,9 @@ def load_profile(s: AppState, json_str: str) -> None:
 
     s.rotation_st  = data.get("rotation_st",  {})
     s.hard_enemies = data.get("hard_enemies", False)
+
+    s.pref_order_st   = data.get("pref_order_st",   {})
+    s.pref_enabled_st = data.get("pref_enabled_st", {})
 
     s.consec_global_val      = data.get("consec_global_val",   "")
     s.consec_global_rest     = data.get("consec_global_rest",  "1")
@@ -139,6 +147,19 @@ def load_profile(s: AppState, json_str: str) -> None:
         s.weights_last_value.pop(k, None)
         if k in s.weights_order:
             s.weights_order.remove(k)
+
+    # ── Displacement ──────────────────────────────────────────────────
+    s.location_names_st    = data.get("location_names_st", ["Default"])
+    s.task_location_idx_st = data.get("task_location_idx_st", {})
+
+    raw_tt = _dec(data.get("travel_time_st", {}))
+    s.travel_time_st = {}
+    for k, v in raw_tt.items():
+        if isinstance(k, tuple) and len(k) == 2:
+            try:
+                s.travel_time_st[(int(k[0]), int(k[1]))] = v
+            except (ValueError, TypeError):
+                pass
 
     # ── Reset run state ───────────────────────────────────────────────
     s.solution_history  = []

@@ -14,8 +14,8 @@ attribute, which an ft.Row provides.
 
 import flet as ft
 from constants import _s
-from tabs.dimensions.captain_rules   import CaptainRulesManager
-from tabs.dimensions.mandatory_rules import MandatoryRulesManager
+from tabs.rules.captain_rules   import CaptainRulesManager
+from tabs.rules.mandatory_rules import MandatoryRulesManager
 from .quota_rules                    import QuotaRulesManager
 
 

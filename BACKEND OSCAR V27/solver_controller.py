@@ -1,7 +1,11 @@
+import sys
 import threading
+import traceback
 import flet as ft
 from constants import _s
+from ui_helpers import UIHelpers
 from tabs.output import OutputTab
+from tabs.preferences import PreferencesTab
 from solve_model_pace_15 import solve_model
 
 
@@ -9,6 +13,7 @@ class SolverController:
 
     def __init__(self, state, page: ft.Page,
                  output_tab: OutputTab,
+                 pref_tab: PreferencesTab,
                  on_solve_blocked_update,
                  switch_page_cb,
                  ui_lock: threading.Lock,
@@ -16,81 +21,56 @@ class SolverController:
         self.state    = state
         self.page     = page
         self._out     = output_tab
+        self._pref    = pref_tab
         self._upd     = on_solve_blocked_update
         self._switch  = switch_page_cb
         self._lock    = ui_lock
         self._sw_live = live_callbacks_sw
 
-    # ── helper: parse optional positive int from state ────────────────
+    # ── Helpers to build solver input dicts ──────────────────────────
 
-    @staticmethod
-    def _safe_pos_int(raw: str) -> int | None:
-        raw = raw.strip()
-        if not raw:
-            return None
-        try:
-            v = int(raw)
-            return v if v > 0 else None
-        except ValueError:
-            return None
+    def _build_consec_dicts(self, people):
+        """Returns (max_consec, capacity, max_hours_per_day, max_hours_per_event)."""
+        s    = self.state
+        _spi = UIHelpers.parse_pos_int
 
-    def do_solve(self, e):
-        s = self.state
-        if s.running_model_ref[0] is not None:
-            s.running_model_ref[0].terminate()
-        if s.solve_blocked:
-            return
-
-        people, tasks, hours, days = s.dims()
-        groups = s.build_groups(people)
-
-        _spi = self._safe_pos_int
-
-        # ── Build max_consec dict ─────────────────────────────────────
-        max_consec: dict = {}
         global_limit_raw = s.consec_global_val.strip()
         global_rest_raw  = s.consec_global_rest.strip()
+        global_cap_raw   = getattr(s, "consec_global_capacity", "100").strip()
+        global_max_day_raw   = getattr(s, "consec_global_max_day", "").strip()
+        global_max_event_raw = getattr(s, "consec_global_max_event", "").strip()
+
+        max_consec          : dict = {}
+        capacity            : dict = {}
+        max_hours_per_day   : dict = {}
+        max_hours_per_event : dict = {}
 
         for p in people:
-            if p in s.consec_personalized_persons:
+            personalized = p in s.consec_personalized_persons
+
+            if personalized:
                 raw_limit = s.consec_per_person.get(p, "").strip()
                 raw_rest  = s.consec_rest_per_person.get(p, "").strip()
+                raw_cap   = s.consec_capacity_per_person.get(p, "100").strip()
+                raw_day   = s.consec_max_day_per_person.get(p, "").strip()
+                raw_event = s.consec_max_event_per_person.get(p, "").strip()
             else:
                 raw_limit = global_limit_raw
                 raw_rest  = global_rest_raw
+                raw_cap   = global_cap_raw
+                raw_day   = global_max_day_raw
+                raw_event = global_max_event_raw
 
             limit = _spi(raw_limit)
             if limit is not None:
                 rest = _spi(raw_rest) or 1
                 max_consec[p] = (limit, rest)
 
-        # ── Build capacity dict ───────────────────────────────────────
-        global_cap_raw = getattr(s, "consec_global_capacity", "100").strip()
-        capacity: dict = {}
-        for p in people:
-            if p in s.consec_personalized_persons:
-                raw_cap = s.consec_capacity_per_person.get(p, "100").strip()
-            else:
-                raw_cap = global_cap_raw
             try:
-                capacity[p] = max(0.0, min(1.0, int(raw_cap) / 100.0)) if raw_cap else 1.0
+                capacity[p] = (max(0.0, min(1.0, int(raw_cap) / 100.0))
+                               if raw_cap else 1.0)
             except ValueError:
                 capacity[p] = 1.0
-
-        # ── Build max hours per day / per event dicts ─────────────────
-        global_max_day_raw   = getattr(s, "consec_global_max_day", "").strip()
-        global_max_event_raw = getattr(s, "consec_global_max_event", "").strip()
-
-        max_hours_per_day:   dict = {}
-        max_hours_per_event: dict = {}
-
-        for p in people:
-            if p in s.consec_personalized_persons:
-                raw_day   = s.consec_max_day_per_person.get(p, "").strip()
-                raw_event = s.consec_max_event_per_person.get(p, "").strip()
-            else:
-                raw_day   = global_max_day_raw
-                raw_event = global_max_event_raw
 
             v = _spi(raw_day)
             if v is not None:
@@ -100,7 +80,11 @@ class SolverController:
             if v is not None:
                 max_hours_per_event[p] = v
 
-        # ── Availability / emergency ──────────────────────────────────
+        return max_consec, capacity, max_hours_per_day, max_hours_per_event
+
+    def _build_availability_demand(self, people, tasks, hours, days):
+        """Returns (availability, emergency, demand)."""
+        s = self.state
         availability: dict = {}
         emergency   : dict = {}
         for p in people:
@@ -115,15 +99,15 @@ class SolverController:
             for j in days:
                 for h in hours[j]:
                     raw = s.demand_st.get((t, h, j), "1").strip()
-                    try:    demand[(t, h, j)] = int(raw) if raw else 0
-                    except: demand[(t, h, j)] = 0
+                    try:
+                        demand[(t, h, j)] = int(raw) if raw else 0
+                    except ValueError:
+                        demand[(t, h, j)] = 0
+        return availability, emergency, demand
 
-        X_prev     = s.build_x_prev(people, tasks, hours, days)
-        using_base = s.base_run_idx is not None
-        live_status = (f"Solving… (Base: Run #{s.base_run_idx+1})"
-                       if using_base else "Solving...")
-
-        # ── Derive force / just_work / force_rest from mandatory_rules ──
+    def _build_force_dicts(self, people, tasks, hours, days):
+        """Returns (force_dict, just_work_dict, force_rest_dict)."""
+        s = self.state
         force_active      = {}
         just_work_active  = {}
         force_rest_active = {}
@@ -162,8 +146,35 @@ class SolverController:
             (p, h, j): force_rest_active.get((p, h, j), 0)
             for p in people for j in days for h in hours[j]
         }
+        return force_dict, just_work_dict, force_rest_dict
 
-        # ── Task duration ─────────────────────────────────────────────
+    # ── Main solve entry point ───────────────────────────────────────
+
+    def do_solve(self, e):
+        s = self.state
+        if s.running_model_ref[0] is not None:
+            s.running_model_ref[0].terminate()
+        if s.solve_blocked:
+            return
+
+        people, tasks, hours, days = s.dims()
+        groups = s.build_groups(people)
+
+        max_consec, capacity, max_hours_per_day, max_hours_per_event = \
+            self._build_consec_dicts(people)
+
+        availability, emergency, demand = \
+            self._build_availability_demand(people, tasks, hours, days)
+
+        force_dict, just_work_dict, force_rest_dict = \
+            self._build_force_dicts(people, tasks, hours, days)
+
+        X_prev      = s.build_x_prev(people, tasks, hours, days)
+        using_base  = s.base_run_idx is not None
+        live_status = (f"Solving… (Base: Run #{s.base_run_idx+1})"
+                       if using_base else "Solving...")
+
+        # Task duration
         task_duration = {}
         for t in tasks:
             raw = s.task_duration_st.get(t, "1").strip()
@@ -174,27 +185,17 @@ class SolverController:
             if dur > 1:
                 task_duration[t] = dur
 
-        # ── Task priority ─────────────────────────────────────────────
-        # The order of `tasks` comes from the textfield (which the
-        # drag-and-drop UI keeps in sync). Top of the list = highest
-        # priority. Linear formula:
-        #
-        #     priority(rank) = 1 + (N - rank)     rank 0 = top
-        #
-        # Example for N = 5:
-        #     rank 0  →  6x penalty   (most critical)
-        #     rank 1  →  5x
-        #     rank 2  →  4x
-        #     rank 3  →  3x
-        #     rank 4  →  2x           (least critical)
-        #
-        # The solver multiplies the uncovered-slot penalty `m[t,h,d]`
-        # by this value in the W_COVERAGE term of the objective.
+        # Task priority
         N_tasks = len(tasks)
-        task_priority = {
-            t: 1 + (N_tasks - rank)
-            for rank, t in enumerate(tasks)
-        }
+        task_priority = {t: 1 + (N_tasks - rank)
+                         for rank, t in enumerate(tasks)}
+
+        # Displacement / Travel
+        task_location = s.build_task_location(tasks)
+        travel_time   = s.build_travel_time()
+
+        # Preferences
+        pref_cost = self._pref.get_pref_cost(people, tasks)
 
         data = dict(
             people=people, tasks=tasks, hours=hours, days=days,
@@ -206,7 +207,7 @@ class SolverController:
             social    = {(p1, p2): s.social_st.get((p1, p2), 0)
                          for i, p1 in enumerate(people)
                          for p2 in people[i+1:]},
-            pref_cost = {(p, t): 1 for p in people for t in tasks},
+            pref_cost = pref_cost,
             rotation  = {t: 1 for t in tasks if s.rotation_st.get(t, "R") == "R"},
             sticky    = {t: 1 for t in tasks if s.rotation_st.get(t, "R") == "S"},
             X_prev    = X_prev,
@@ -225,6 +226,8 @@ class SolverController:
             capacity         = capacity,
             max_hours_per_day   = max_hours_per_day,
             max_hours_per_event = max_hours_per_event,
+            task_location       = task_location,
+            travel_time         = travel_time,
         )
 
         self._out.rebuild(
@@ -232,7 +235,7 @@ class SolverController:
             live_people=people, live_tasks=tasks, live_hours=hours,
             live_days=days, live_avail=availability, live_emerg=emergency,
             live_groups=groups)
-        self._switch(7)
+        self._switch(9)
 
         def _update_ui(partial_sol):
             if not self._lock.acquire(blocking=False):
@@ -245,7 +248,7 @@ class SolverController:
                     live_groups=groups)
                 self.page.update()
             except Exception:
-                pass
+                traceback.print_exc(file=sys.stderr)
             finally:
                 self._lock.release()
 
